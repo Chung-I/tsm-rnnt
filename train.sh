@@ -1,1 +1,1 @@
-python3 -W ignore run.py train experiments/stt.jsonnet -s $1 --include-package stt
+python3 -W ignore run.py train $1 -s $2 --include-package stt
