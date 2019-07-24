@@ -20,8 +20,8 @@ from stt.dataset_readers.utils import pad_and_stack
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
-@DatasetReader.register("kaldi-stt")
-class KaldiSpeechToTextDatasetReader(DatasetReader):
+@DatasetReader.register("stt")
+class SpeechToTextDatasetReader(DatasetReader):
     """
     Read a tsv file containing paired sequences, and create a dataset suitable for a
     ``SimpleSeq2Seq`` model, or any model with a matching API.

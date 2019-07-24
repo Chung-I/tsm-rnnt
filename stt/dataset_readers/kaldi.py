@@ -1,17 +1,20 @@
 import csv
-from typing import Dict, Iterable
+from typing import Dict, Iterable, List, Tuple
 import logging
 import random
+import glob
+import re
 import numpy as np
-
 from overrides import overrides
+from opencc import OpenCC
 
+import kaldi_io
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import START_SYMBOL, END_SYMBOL
 from allennlp.data.dataset_readers.dataset_reader import DatasetReader
 from allennlp.data.fields import TextField, ArrayField, MetadataField, LabelField
 from allennlp.data.instance import Instance
-from allennlp.data.tokenizers import Tokenizer, WordTokenizer
+from allennlp.data.tokenizers import Tokenizer, WordTokenizer, Token
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
 
 from stt.dataset_readers.utils import pad_and_stack
@@ -19,8 +22,29 @@ from stt.dataset_readers.utils import pad_and_stack
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
-@DatasetReader.register("stt")
-class SpeechToTextDatasetReader(DatasetReader):
+def process_phone(phone, remove_tone=True):
+    if remove_tone:
+        phone = re.sub("\d+", "", phone)
+    return phone
+
+def word_to_phones(lexicon):
+    def w2p(word):
+        phones = []
+        try:
+            phones.extend(re.split("\s+", lexicon[word]))
+        except KeyError:
+            for char in word:
+                try:
+                    phones.extend(re.split("\s+", lexicon[char]))
+                except KeyError:
+                    pass
+        phones = [process_phone(phone) for phone in phones]
+        return phones
+
+    return w2p
+
+@DatasetReader.register("kaldi-stt")
+class KaldiSpeechToTextDatasetReader(DatasetReader):
     """
     Read a tsv file containing paired sequences, and create a dataset suitable for a
     ``SimpleSeq2Seq`` model, or any model with a matching API.
@@ -49,6 +73,8 @@ class SpeechToTextDatasetReader(DatasetReader):
     """
     def __init__(self,
                  shard_size: int,
+                 lexicon_path: str,
+                 transcript_path: str,
                  input_stack_rate: int = 1,
                  model_stack_rate: int = 1,
                  target_tokenizer: Tokenizer = None,
@@ -56,6 +82,22 @@ class SpeechToTextDatasetReader(DatasetReader):
                  delimiter: str = "\t",
                  lazy: bool = False) -> None:
         super().__init__(lazy)
+        transcript_files = glob.glob(transcript_path)
+        self.transcripts: Dict[str, str] = {}
+        for transcript_file in transcript_files:
+            with open(transcript_file) as f:
+                for line in f.read().splitlines():
+                    end, start = re.search(r'\s+', line).span()
+                    self.transcripts[line[:end]] = line[start:]
+
+        self.lexicon: Dict[str, str] = {}
+        with open(lexicon_path) as f:
+            for line in f.read().splitlines():
+                end, start = re.search(r'\s+', line).span()
+                self.lexicon[line[:end]] = line[start:]
+
+        self.cc = OpenCC('s2t')
+        self.w2p = word_to_phones(self.lexicon)
         self._target_tokenizer = target_tokenizer or WordTokenizer()
         self._target_token_indexers = target_token_indexers or {"tokens": SingleIdTokenIndexer()}
         self._delimiter = delimiter
@@ -69,32 +111,26 @@ class SpeechToTextDatasetReader(DatasetReader):
         logger.info('Loading data from %s', file_path)
         dropped_instances = 0
 
-        rows = []
-        with open(file_path + '.tsv', "r") as data_file:
-            for line_num, row in enumerate(csv.reader(data_file, delimiter=self._delimiter)):
-                if len(row) != 4:
-                    raise ConfigurationError("Invalid line format: %s (line number %d)" % (row, line_num + 1))
-                rows.append(row)
+        feats: List[Tuple[str, np.ndarray]] = [(key, mat) for key, mat in
+                                               kaldi_io.read_mat_scp(file_path)]
+        feats = sorted(feats, key=lambda pair: pair[1].shape[0])
 
-        dataset_size = len(rows)
-
-        source_datas = np.load(file_path + '.npy', mmap_mode='r')
+        dataset_size = len(feats)
 
         batched_indices = list(range(0, dataset_size, self._shard_size))
         random.shuffle(batched_indices)
         for start_idx in batched_indices:
             end_idx = min(start_idx + self._shard_size, dataset_size)
             for idx in range(start_idx, end_idx):
-                data = rows[idx]
-                src = source_datas[int(data[-2]):int(data[-1])]
-                tgt = data[1]
+                key, src = feats[idx]
+                tgt = self.transcripts[key]
                 instance = self.text_to_instance(src, tgt)
                 tgt_len = instance.fields['target_tokens'].sequence_length()
                 if tgt_len < 1:
                     dropped_instances += 1
                 else:
                     yield instance
-                del data
+                del src
                 del instance
         if not dropped_instances:
             logger.info("No instances dropped from {}.".format(file_path))
@@ -114,13 +150,17 @@ class SpeechToTextDatasetReader(DatasetReader):
         source_field = ArrayField(source_array)
         if target_string is not None:
             tokenized_target = self._target_tokenizer.tokenize(target_string)
-            # tokenized_target.insert(0, Token(START_SYMBOL))
-            # tokenized_target.append(Token(END_SYMBOL))
-            target_field = TextField(tokenized_target, self._target_token_indexers)
+            phonemized_target: List[str] = []
+            for word in tokenized_target:
+                word = self.cc.convert(word.text)
+                phonemized_target.extend(self.w2p(word))
+
+            # print(target_string, phonemized_target)
+            target_field = TextField([Token(x) for x in phonemized_target],
+                            self._target_token_indexers)
             return Instance({"source_features": source_field,
                              "target_tokens": target_field,
                              "source_lengths": source_length_field})
         else:
             return Instance({"source_features": source_field,
                              "source_lengths": source_length_field})
-
