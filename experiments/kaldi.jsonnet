@@ -1,5 +1,7 @@
 local BATCH_SIZE = 32;
 local FRAME_RATE = 3;
+local VOCAB_PATH = ext.stdVar('MODEL_PATH') + "/vocabulary";
+local TARGET_NAMESPACE = "target_tokens";
 
 {
   "dataset_reader": {
@@ -19,13 +21,10 @@ local FRAME_RATE = 3;
     "target_token_indexers": {
       "tokens": {
         "type": "single_id",        
-        "namespace": "target_tokens"
+        "namespace": TARGET_NAMESPACE
       }
     }
   },
-  /*"vocabulary": {
-    "directory_path": "data/vocabulary"
-  },*/
   "train_data_path": "/home/nlpmaster/Works/egs/aidatatang_200zh/s5/fbank/raw_fbank_pitch_train.1.scp",
   "validation_data_path": "/home/nlpmaster/Works/egs/aidatatang_200zh/s5/fbank/raw_fbank_pitch_dev.1.scp",
   "test_data_path": "/home/nlpmaster/Works/egs/aidatatang_200zh/s5/fbank/raw_fbank_pitch_test.1.scp",
@@ -43,22 +42,32 @@ local FRAME_RATE = 3;
       "wdrop": 0.1,
       "stack_rates": [1, 1, 2, 1],
     },
-    "target_namespace": "target_tokens",
+    "vocab_path": VOCAB_PATH,
+    "target_namespace": TARGET_NAMESPACE,
   },
   "iterator": {
     "type": "bucket",
     "padding_noise": 0.0,
     "batch_size" : BATCH_SIZE,
     "sorting_keys": [["source_features", "dimension_0"],
-                     ["target_tokens", "num_tokens"]]
+                     [TARGET_NAMESPACE, "num_tokens"]]
   },
   "trainer": {
-    "num_epochs": 150,
+    "num_epochs": 300,
     "patience": 10,
     "grad_clipping": 5.0,
     "cuda_device": 0,
+    "validation_metric": "-WER",
+    "num_serialized_models_to_keep": 1,
+    "learning_rate_scheduler": {
+      "type": "reduce_on_plateau",
+      "factor": 0.8,
+      "mode": "min",
+      "patience": 5
+    },
     "optimizer": {
-      "type": "dense_sparse_adam"
+      "type": "dense_sparse_adam",
+      "lr": 0.0003
     }
   }
 }

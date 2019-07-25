@@ -2,6 +2,8 @@ local BATCH_SIZE = 32;
 local FRAME_RATE = 3;
 local NUM_THREADS = 1;
 local NUM_GPUS = 1;
+local VOCAB_PATH = ext.stdVar('MODEL_PATH') + "/vocabulary";
+local TARGET_NAMESPACE = "target_tokens";
 
 local BASE_READER = {
     "type": "kaldi-stt",
@@ -20,7 +22,7 @@ local BASE_READER = {
     "target_token_indexers": {
       "tokens": {
         "type": "single_id",        
-        "namespace": "target_tokens"
+        "namespace": TARGET_NAMESPACE
       }
     }
 };
@@ -39,9 +41,6 @@ local BASE_ITERATOR = {
     "num_workers": NUM_THREADS,
     "output_queue_size": 1024
   },
-  "vocabulary": {
-    "directory_path": "data/vocabulary"
-  },
   "train_data_path": std.extVar('DATA_HOME') + "/data/*/data/mfcc/train/raw_mfcc_train.*.scp",
   "validation_data_path": std.extVar('DATA_HOME') + "/data/PTS_clear/data/mfcc/test/raw_mfcc_test.*.scp",
   "test_data_path": std.extVar('DATA_HOME') + "/data/Youtube2/data/mfcc/test/raw_mfcc_test.*.scp",
@@ -59,7 +58,8 @@ local BASE_ITERATOR = {
       "wdrop": 0.1,
       "stack_rates": [1, 1, 2, 1],
     },
-    "target_namespace": "target_tokens",
+    "vocab_path": VOCAB_PATH,
+    "target_namespace": TARGET_NAMESPACE,
   },
   "iterator": {
     "type": "multiprocess",
@@ -68,12 +68,21 @@ local BASE_ITERATOR = {
     "output_queue_size": 1024
   },
   "trainer": {
-    "num_epochs": 150,
+    "num_epochs": 300,
     "patience": 10,
     "grad_clipping": 5.0,
     "cuda_device": 0,
+    "validation_metric": "-WER",
+    "num_serialized_models_to_keep": 1,
+    "learning_rate_scheduler": {
+      "type": "reduce_on_plateau",
+      "factor": 0.8,
+      "mode": "min",
+      "patience": 5
+    },
     "optimizer": {
-      "type": "dense_sparse_adam"
+      "type": "dense_sparse_adam",
+      "lr": 0.0003
     }
   }
 }
