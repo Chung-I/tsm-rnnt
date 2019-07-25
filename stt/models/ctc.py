@@ -1,5 +1,6 @@
 from typing import Dict, Optional, List, Any
 
+import os
 import numpy
 from overrides import overrides
 import torch
@@ -16,9 +17,11 @@ from allennlp.nn import InitializerApplicator, RegularizerApplicator
 from allennlp.nn.util import get_text_field_mask, sequence_cross_entropy_with_logits, \
     get_lengths_from_binary_sequence_mask, get_mask_from_sequence_lengths
 from allennlp.training.metrics import BLEU
-from stt.models.utils import pad_to_multiples
-from stt.models.custom_lstms import script_lnlstm, script_lstm, LSTMState
-from stt.models.awd_rnn import AWDRNN
+from ds_ctcdecoder import ctc_beam_search_decoder_batch
+
+from stt.models.ctc_prefix_score import CTCPrefixScore
+from stt.data.text import Alphabet
+from stt.training.word_error_rate import WordErrorRate
 
 
 @Model.register("ctc")
@@ -56,7 +59,9 @@ class CTCModel(Model):
     def __init__(self, vocab: Vocabulary,
                  encoder: Seq2SeqEncoder,
                  loss_type: str = "ctc",
+                 beam_size: int = 5,
                  target_namespace: str = "target_tokens",
+                 vocab_path: str = "phonemes/vocabulary",
                  verbose_metrics: bool = False,
                  initializer: InitializerApplicator = InitializerApplicator(),
                  regularizer: Optional[RegularizerApplicator] = None) -> None:
@@ -69,23 +74,22 @@ class CTCModel(Model):
         self.projection_layer = TimeDistributed(Linear(encoder.get_output_dim(),
                                                        self.num_classes))
 
-        self.blank_idx = self.vocab.get_token_index(DEFAULT_PADDING_TOKEN)
+        self._blank_idx = self.vocab.get_token_index(DEFAULT_PADDING_TOKEN)
         self._loss_type = loss_type
         if self._loss_type == "ctc":
-            self._loss = CTCLoss(blank=self.blank_idx, zero_infinity=True)
+            self._loss = CTCLoss(blank=self._blank_idx, zero_infinity=True)
         elif self._loss_type == "rnnt":
             from warprnnt_pytorch import RNNTLoss
-            self._loss = RNNTLoss(blank=self.blank_idx)
+            self._loss = RNNTLoss(blank=self._blank_idx)
 
+        self._decoder = ctc_beam_search_decoder_batch
+        self._alphabet = Alphabet(os.path.join(
+            vocab_path, target_namespace + ".txt"))
+        self._beam_size = beam_size
+        self._num_processes = beam_size
+        self._wer = WordErrorRate()
 
         initializer(self)
-
-    def _init_state(self, src_feats):
-        _, batch_size, _ = src_feats.size()
-        states = [LSTMState(src_feats.new_zeros(batch_size, self._enc_hidden_size),
-                            src_feats.new_zeros(batch_size, self._enc_hidden_size),)
-                  for _ in range(self._enc_num_layers)]
-        return states
 
     @overrides
     def forward(self,  # type: ignore
@@ -126,7 +130,8 @@ class CTCModel(Model):
 
         """
         target_mask = get_text_field_mask(target_tokens)
-        encoded_features, source_lengths = self.encoder(source_features, source_lengths)
+        encoded_features, source_lengths = self.encoder(
+            source_features, source_lengths)
         batch_size, src_out_len, _ = encoded_features.size()
 
         logits = self.projection_layer(encoded_features)
@@ -145,6 +150,19 @@ class CTCModel(Model):
                               source_lengths,
                               target_lengths)
             output_dict["loss"] = loss
+            if not self.training:
+                import pdb
+                pdb.set_trace()
+                probs = torch.exp(log_probs)
+                batch_beam_results = \
+                    self._decoder(probs.tolist(), source_lengths.tolist(),
+                                  self._alphabet, self._beam_size,
+                                  self._num_processes)
+                batch_best_results = [
+                    beam_results[0][1] for beam_results in batch_beam_results
+                ]
+                self._wer(batch_best_results, target_tokens["tokens"].tolist(),
+                          target_lengths.tolist())
 
         return output_dict
 
@@ -157,7 +175,8 @@ class CTCModel(Model):
         all_predictions = output_dict['class_probabilities']
         all_predictions = all_predictions.cpu().data.numpy()
         if all_predictions.ndim == 3:
-            predictions_list = [all_predictions[i] for i in range(all_predictions.shape[0])]
+            predictions_list = [all_predictions[i]
+                                for i in range(all_predictions.shape[0])]
         else:
             predictions_list = [all_predictions]
         all_tags = []
@@ -171,4 +190,7 @@ class CTCModel(Model):
 
     @overrides
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
-        return {}
+        all_metrics: Dict[str, float] = {}
+        if not self.training:
+            all_metrics.update(self._wer.get_metric(reset=reset))
+        return all_metrics
