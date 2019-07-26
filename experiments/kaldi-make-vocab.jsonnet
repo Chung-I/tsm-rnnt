@@ -11,8 +11,8 @@ local BASE_READER = {
     "shard_size": BATCH_SIZE,
     "input_stack_rate": FRAME_RATE,
     "model_stack_rate": 2,
-    "lexicon_path": std.extVar('DATA_HOME') + "/ASR-Training/resource-en/lexicon.txt",
-    "transcript_path": std.extVar('DATA_HOME') + "/data/*/data/mfcc/*/seg.scp",
+    "lexicon_path": "/home/nlpmaster/lexicon.txt",
+    "transcript_path": "/home/nlpmaster/Works/egs/aidatatang_200zh/s5/data/*/text",
     "target_tokenizer": {
       "type": "word",
       "word_splitter": {
@@ -30,7 +30,8 @@ local BASE_ITERATOR = {
   "type": "bucket",
   "max_instances_in_memory": 64 * NUM_GPUS,
   "batch_size": BATCH_SIZE,
-  "sorting_keys": [["source_features", "dimension_0"]],
+  "sorting_keys": [["source_features", "dimension_0"],
+                   [TARGET_NAMESPACE, "num_tokens"]],
   "maximum_samples_per_batch": ["dimension_0", 6400]
 };
 
@@ -41,12 +42,9 @@ local BASE_ITERATOR = {
     "num_workers": NUM_THREADS,
     "output_queue_size": 1024
   },
-  "train_data_path": std.extVar('DATA_HOME') + "/data/*/data/mfcc/train/raw_mfcc_train.*.scp",
-  "validation_data_path": std.extVar('DATA_HOME') + "/data/PTS_clear/data/mfcc/test/raw_mfcc_test.*.scp",
-  "test_data_path": std.extVar('DATA_HOME') + "/data/Youtube2/data/mfcc/test/raw_mfcc_test.*.scp",
-  "vocabulary": {
-    "directory_path": VOCAB_PATH
-  },
+  "train_data_path": "/home/nlpmaster/Works/egs/aidatatang_200zh/s5/fbank/*_train.*.scp",
+  "validation_data_path": "/home/nlpmaster/Works/egs/aidatatang_200zh/s5/fbank/*_dev.*.scp",
+  "test_data_path": "/home/nlpmaster/Works/egs/aidatatang_200zh/s5/fbank/*_test.*.scp",
   "model": {
     "type": "ctc",
     "loss_type": "ctc",
@@ -54,12 +52,12 @@ local BASE_ITERATOR = {
       "type": "awd-rnn",
       "input_size": 83 * FRAME_RATE,
       "hidden_size": 512,
-      "num_layers": 4,
-      "dropout": 0.5,
-      "dropouth": 0.5,
-      "dropouti": 0.5,
-      "wdrop": 0.1,
-      "stack_rates": [1, 1, 2, 1],
+      "num_layers": 1,
+      "dropout": 0.0,
+      "dropouth": 0.0,
+      "dropouti": 0.0,
+      "wdrop": 0.0,
+      "stack_rates": [2],
     },
     "vocab_path": VOCAB_PATH,
     "target_namespace": TARGET_NAMESPACE,

@@ -44,9 +44,6 @@ local BASE_ITERATOR = {
   "train_data_path": std.extVar('DATA_HOME') + "/data/*/data/mfcc/train/raw_mfcc_train.*.scp",
   "validation_data_path": std.extVar('DATA_HOME') + "/data/PTS_clear/data/mfcc/test/raw_mfcc_test.*.scp",
   "test_data_path": std.extVar('DATA_HOME') + "/data/Youtube2/data/mfcc/test/raw_mfcc_test.*.scp",
-  "vocabulary": {
-    "directory_path": VOCAB_PATH
-  },
   "model": {
     "type": "ctc",
     "loss_type": "ctc",
