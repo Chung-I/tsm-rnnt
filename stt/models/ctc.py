@@ -19,7 +19,6 @@ from allennlp.nn.util import get_text_field_mask, sequence_cross_entropy_with_lo
 from allennlp.training.metrics import BLEU
 from ds_ctcdecoder import ctc_beam_search_decoder_batch
 
-from stt.models.ctc_prefix_score import CTCPrefixScore
 from stt.data.text import Alphabet
 from stt.training.word_error_rate import WordErrorRate
 
@@ -151,8 +150,6 @@ class CTCModel(Model):
                               target_lengths)
             output_dict["loss"] = loss
             if not self.training:
-                import pdb
-                pdb.set_trace()
                 probs = torch.exp(log_probs)
                 batch_beam_results = \
                     self._decoder(probs.tolist(), source_lengths.tolist(),
