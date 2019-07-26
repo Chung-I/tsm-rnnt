@@ -2,7 +2,7 @@ local BATCH_SIZE = 32;
 local FRAME_RATE = 3;
 local NUM_THREADS = 1;
 local NUM_GPUS = 1;
-local VOCAB_PATH = ext.stdVar('MODEL_PATH') + "/vocabulary";
+local VOCAB_PATH = std.extVar('VOCAB_PATH') + "/vocabulary";
 local TARGET_NAMESPACE = "target_tokens";
 
 local BASE_READER = {
@@ -42,6 +42,9 @@ local BASE_ITERATOR = {
     "num_workers": NUM_THREADS,
     "output_queue_size": 1024
   },
+  "vocabulary": {
+    "directory_path": VOCAB_PATH,
+  },
   "train_data_path": "/home/nlpmaster/Works/egs/aidatatang_200zh/s5/fbank/*_train.*.scp",
   "validation_data_path": "/home/nlpmaster/Works/egs/aidatatang_200zh/s5/fbank/*_dev.*.scp",
   "test_data_path": "/home/nlpmaster/Works/egs/aidatatang_200zh/s5/fbank/*_test.*.scp",
@@ -52,12 +55,12 @@ local BASE_ITERATOR = {
       "type": "awd-rnn",
       "input_size": 83 * FRAME_RATE,
       "hidden_size": 512,
-      "num_layers": 4,
-      "dropout": 0.5,
-      "dropouth": 0.5,
-      "dropouti": 0.5,
-      "wdrop": 0.1,
-      "stack_rates": [1, 1, 2, 1],
+      "num_layers": 1,
+      "dropout": 0.0,
+      "dropouth": 0.0,
+      "dropouti": 0.0,
+      "wdrop": 0.0,
+      "stack_rates": [2],
     },
     "vocab_path": VOCAB_PATH,
     "target_namespace": TARGET_NAMESPACE,

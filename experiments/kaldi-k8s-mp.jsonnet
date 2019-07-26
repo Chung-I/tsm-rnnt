@@ -2,7 +2,7 @@ local BATCH_SIZE = 32;
 local FRAME_RATE = 3;
 local NUM_THREADS = 1;
 local NUM_GPUS = 1;
-local VOCAB_PATH = ext.stdVar('MODEL_PATH') + "/vocabulary";
+local VOCAB_PATH = std.extVar('MODEL_PATH') + "/vocabulary";
 local TARGET_NAMESPACE = "target_tokens";
 
 local BASE_READER = {
