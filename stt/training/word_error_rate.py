@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Set
 
 from overrides import overrides
 import torch
@@ -19,14 +19,14 @@ class WordErrorRate(Metric):
         A list of label ids to ignore when computing metrics.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, exclude_indices: Set[int] = None) -> None:
+        self._exclude_indices = exclude_indices or set()
         self._total_errors = 0.
         self._total_words = 0.
 
     def __call__(self,  # type: ignore
-                 predicted_indices: List[List[int]],
-                 gold_indices: List[List[int]],
-                 target_lengths: List[int]):
+                 predictions: torch.LongTensor,
+                 gold_targets: torch.LongTensor) -> None:
         """
         Parameters
         ----------
@@ -37,10 +37,18 @@ class WordErrorRate(Metric):
         lengths: ``List[int]``, required.
             A tensor of the same shape as ``predicted_indices``.
         """
-        for predicted, gold, length in zip(predicted_indices, gold_indices, target_lengths):
-            self._total_errors += levenshtein(predicted,
-                                              gold[:length])
-            self._total_words += length
+        predictions, gold_targets = self.unwrap_to_tensors(predictions, gold_targets)
+
+        predictions = [list(filter(lambda idx: idx not in self._exclude_indices, prediction))
+            for prediction in predictions.tolist()]
+
+        gold_targets = [list(filter(lambda idx: idx not in self._exclude_indices, gold_target))
+            for gold_target in gold_targets.tolist()]
+
+        for prediction, target in zip(predictions, gold_targets):
+            self._total_errors += levenshtein(prediction,
+                                              target)
+            self._total_words += len(target)
 
     def get_metric(self, reset: bool = False):
         """

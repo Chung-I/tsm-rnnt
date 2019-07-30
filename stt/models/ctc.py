@@ -129,7 +129,7 @@ class CTCModel(Model):
 
         """
         target_mask = get_text_field_mask(target_tokens)
-        encoded_features, source_lengths = self.encoder(
+        encoded_features, _, source_lengths = self.encoder(
             source_features, source_lengths)
         batch_size, src_out_len, _ = encoded_features.size()
 
