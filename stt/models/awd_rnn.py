@@ -7,12 +7,16 @@ from torch.autograd import Variable
 from allennlp.modules.seq2seq_encoders.seq2seq_encoder import Seq2SeqEncoder
 from stt.models.weight_drop import WeightDrop
 
+
 class pRNNLayer(nn.Module):
-    def __init__(self, rnn, input_size, hidden_size, stack_rate: int = 1):
+    def __init__(self, rnn, input_size, hidden_size, stack_rate: int = 1, wdrop: float = 0):
         super(pRNNLayer, self).__init__()
         self.stack_rate = stack_rate
         self.module = rnn(input_size * stack_rate,
                           hidden_size, num_layers=1, dropout=0)
+        if wdrop:
+            self.module = WeightDrop(self.module, ['weight_hh_l0'], dropout=wdrop)
+
     def forward(self, inputs, states, lengths):
         seq_len, batch_size, feat_dim = inputs.size()
         if self.stack_rate != 1:
@@ -24,6 +28,7 @@ class pRNNLayer(nn.Module):
             lengths = torch.ceil(lengths.float() / self.stack_rate).long()
         return self.module.forward(inputs, states), lengths
 
+
 class LockedDropout(nn.Module):
 
     def forward(self, x, dropout=0.5):
@@ -34,14 +39,15 @@ class LockedDropout(nn.Module):
         mask = mask.expand_as(x)
         return mask * x
 
+
 @Seq2SeqEncoder.register('awd-rnn')
 class AWDRNN(Seq2SeqEncoder):
     """Container module with an encoder, a recurrent module, and a decoder."""
 
     def __init__(self,
                  input_size: int, hidden_size: int, num_layers: int,
-                 rnn_type: str ='LSTM', dropout: int = 0.5, dropouth: int = 0.5,
-                 dropouti: int = 0.5, dropoute: int = 0.1, wdrop: int = 0,
+                 rnn_type: str = 'LSTM', dropout: float = 0.5, dropouth: float = 0.5,
+                 dropouti: float = 0.5, dropoute: float = 0.1, wdrop: float = 0,
                  stack_rates: List[int] = None):
         super(AWDRNN, self).__init__()
         self.lockdrop = LockedDropout()
@@ -55,11 +61,9 @@ class AWDRNN(Seq2SeqEncoder):
         rnn = getattr(nn, rnn_type)
         self.rnns = [pRNNLayer(rnn,
                                input_size if l == 0 else hidden_size,
-                               hidden_size, stack_rates[l])
+                               hidden_size, stack_rates[l],
+                               wdrop)
                      for l in range(num_layers)]
-        if wdrop:
-            self.rnns = [WeightDrop(rnn, ['weight_hh_l0'], dropout=wdrop)
-                            for rnn in self.rnns]
 
         print(self.rnns)
         self.rnns = torch.nn.ModuleList(self.rnns)
@@ -84,7 +88,8 @@ class AWDRNN(Seq2SeqEncoder):
         self.stack_rates = stack_rates
 
     def reset(self):
-        if self.rnn_type == 'QRNN': [r.reset() for r in self.rnns]
+        if self.rnn_type == 'QRNN':
+            [r.reset() for r in self.rnns]
 
     def init_weights(self):
         pass
@@ -109,7 +114,7 @@ class AWDRNN(Seq2SeqEncoder):
             new_hidden.append(new_h)
             raw_outputs.append(raw_output)
             if l != self.num_layers - 1:
-                #self.hdrop(raw_output)
+                # self.hdrop(raw_output)
                 raw_output = self.lockdrop(raw_output, self.dropouth)
                 outputs.append(raw_output)
         hidden = new_hidden
@@ -117,7 +122,7 @@ class AWDRNN(Seq2SeqEncoder):
         output = self.lockdrop(raw_output, self.dropout)
         outputs.append(output)
 
-        return output.transpose(1, 0), lengths
+        return output.transpose(1, 0), hidden, lengths
 
     def init_hidden(self, bsz):
         weight = next(self.parameters()).data
