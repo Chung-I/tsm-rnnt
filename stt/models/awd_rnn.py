@@ -15,7 +15,8 @@ class pRNNLayer(nn.Module):
         self.module = rnn(input_size * stack_rate,
                           hidden_size, num_layers=1, dropout=0)
         if wdrop:
-            self.module = WeightDrop(self.module, ['weight_hh_l0'], dropout=wdrop)
+            self.module = WeightDrop(
+                self.module, ['weight_hh_l0'], dropout=wdrop)
 
     def forward(self, inputs, states, lengths):
         seq_len, batch_size, feat_dim = inputs.size()
@@ -25,7 +26,11 @@ class pRNNLayer(nn.Module):
                          seq_len // self.stack_rate,
                          feat_dim * self.stack_rate) \
                 .transpose(1, 0)
-            lengths = torch.ceil(lengths.float() / self.stack_rate).long()
+            lengths = torch.floor(
+                torch.clamp(
+                    lengths.float() / self.stack_rate, 1.
+                )
+            ).long()
         return self.module.forward(inputs, states), lengths
 
 
@@ -105,7 +110,7 @@ class AWDRNN(Seq2SeqEncoder):
 
         raw_output = emb
         new_hidden = []
-        #raw_output, hidden = self.rnn(emb, hidden)
+        # raw_output, hidden = self.rnn(emb, hidden)
         raw_outputs = []
         outputs = []
         for l, rnn in enumerate(self.rnns):

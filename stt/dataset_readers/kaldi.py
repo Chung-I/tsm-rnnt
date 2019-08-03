@@ -9,10 +9,9 @@ from overrides import overrides
 from opencc import OpenCC
 
 import kaldi_io
-from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import START_SYMBOL, END_SYMBOL
 from allennlp.data.dataset_readers.dataset_reader import DatasetReader
-from allennlp.data.fields import TextField, ArrayField, MetadataField, LabelField
+from allennlp.data.fields import TextField, ArrayField, LabelField
 from allennlp.data.instance import Instance
 from allennlp.data.tokenizers import Tokenizer, WordTokenizer, Token
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
@@ -26,6 +25,7 @@ def process_phone(phone, remove_tone=True):
     if remove_tone:
         phone = re.sub("\d+", "", phone)
     return phone
+
 
 def word_to_phones(lexicon):
     def w2p(word):
@@ -42,6 +42,7 @@ def word_to_phones(lexicon):
         return phones
 
     return w2p
+
 
 @DatasetReader.register("kaldi-stt")
 class KaldiSpeechToTextDatasetReader(DatasetReader):
@@ -71,6 +72,7 @@ class KaldiSpeechToTextDatasetReader(DatasetReader):
     delimiter : str, (optional, default="\t")
         Set delimiter for tsv/csv file.
     """
+
     def __init__(self,
                  shard_size: int,
                  lexicon_path: str,
@@ -79,6 +81,7 @@ class KaldiSpeechToTextDatasetReader(DatasetReader):
                  model_stack_rate: int = 1,
                  target_tokenizer: Tokenizer = None,
                  target_token_indexers: Dict[str, TokenIndexer] = None,
+                 target_add_start_end_token: bool = False,
                  delimiter: str = "\t",
                  lazy: bool = False) -> None:
         super().__init__(lazy)
@@ -99,11 +102,13 @@ class KaldiSpeechToTextDatasetReader(DatasetReader):
         self.cc = OpenCC('s2t')
         self.w2p = word_to_phones(self.lexicon)
         self._target_tokenizer = target_tokenizer or WordTokenizer()
-        self._target_token_indexers = target_token_indexers or {"tokens": SingleIdTokenIndexer()}
+        self._target_token_indexers = target_token_indexers or {
+            "tokens": SingleIdTokenIndexer()}
         self._delimiter = delimiter
         self._shard_size = shard_size
         self.input_stack_rate = input_stack_rate
         self.model_stack_rate = model_stack_rate
+        self._target_add_start_end_token = target_add_start_end_token
 
     @overrides
     def _read(self, file_path: str) -> Iterable[Instance]:
@@ -155,9 +160,13 @@ class KaldiSpeechToTextDatasetReader(DatasetReader):
                 word = self.cc.convert(word.text)
                 phonemized_target.extend(self.w2p(word))
 
+            if self._target_add_start_end_token:
+                phonemized_target.insert(0, START_SYMBOL)
+                phonemized_target.append(END_SYMBOL)
+
             # print(target_string, phonemized_target)
             target_field = TextField([Token(x) for x in phonemized_target],
-                            self._target_token_indexers)
+                                     self._target_token_indexers)
             return Instance({"source_features": source_field,
                              "target_tokens": target_field,
                              "source_lengths": source_length_field})

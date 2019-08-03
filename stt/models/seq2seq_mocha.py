@@ -20,12 +20,12 @@ from allennlp.nn.beam_search import BeamSearch
 from allennlp.training.metrics import BLEU
 from allennlp.nn import InitializerApplicator
 
-
+from stt.models.cnn import VGGExtractor
 from stt.training.word_error_rate import WordErrorRate as WER
 
 
-@Model.register("seq2seq_luong")
-class Seq2SeqLuong(Model):
+@Model.register("seq2seq_mocha")
+class Seq2SeqMoChA(Model):
     """
     This ``SimpleSeq2Seq`` class is a :class:`Model` which takes a sequence, encodes it, and then
     uses the encoded representations to decode another sequence.  You can use this as the basis for
@@ -76,18 +76,24 @@ class Seq2SeqLuong(Model):
     def __init__(self,
                  vocab: Vocabulary,
                  encoder: Seq2SeqEncoder,
-                 max_decoding_steps: int,
+                 input_size: int,
                  target_embedding_dim: int,
+                 max_decoding_steps: int,
+                 in_channel: int = 1,
+                 has_vgg: bool = False,
+                 vgg_out_channel: int = 128,
                  attention: Attention = None,
                  attention_function: SimilarityFunction = None,
                  beam_size: int = None,
                  target_namespace: str = "tokens",
                  scheduled_sampling_ratio: float = 0.,
                  initializer: InitializerApplicator = InitializerApplicator()) -> None:
-        super(Seq2SeqLuong, self).__init__(vocab)
+        super(Seq2SeqMoChA, self).__init__(vocab)
+        self.input_size = input_size
+        self.in_channel = in_channel  # 3 if has_delta and has_delta_delta
+        self.out_channel = vgg_out_channel
         self._target_namespace = target_namespace
         self._scheduled_sampling_ratio = scheduled_sampling_ratio
-
         # We need the start symbol to provide as the input at the first timestep of decoding, and
         # end symbol as a way to indicate the end of the decoded sequence.
         self._start_index = self.vocab.get_token_index(
@@ -100,7 +106,7 @@ class Seq2SeqLuong(Model):
         self._bleu = BLEU(
             exclude_indices={pad_index, self._end_index, self._start_index})
         self._wer = WER(exclude_indices={
-                        pad_index, self._end_index, self._start_index})
+            pad_index, self._end_index, self._start_index})
 
         # At prediction time, we use a beam search to find the most likely sequence of target tokens.
         beam_size = beam_size or 1
@@ -110,6 +116,10 @@ class Seq2SeqLuong(Model):
 
         # Encodes the sequence of source embeddings into a sequence of hidden states.
         self._encoder = encoder
+
+        self.vgg = None
+        if has_vgg:
+            self.vgg = VGGExtractor(self.in_channel, self.out_channel)
 
         num_classes = self.vocab.get_vocab_size(self._target_namespace)
 
@@ -153,6 +163,7 @@ class Seq2SeqLuong(Model):
         # in order to get log probabilities of each target token, at each time step.
         self._output_projection_layer = Linear(
             self._decoder_output_dim, num_classes)
+        self.input_bn = torch.nn.BatchNorm1d(self.input_size)
 
         initializer(self)
 
@@ -220,6 +231,8 @@ class Seq2SeqLuong(Model):
         -------
         Dict[str, torch.Tensor]
         """
+        source_features = self.input_bn(
+            source_features.transpose(-2, -1)).transpose(-2, -1)
         state = self._encode(source_features, source_lengths)
 
         if target_tokens:
@@ -279,11 +292,13 @@ class Seq2SeqLuong(Model):
                 source_features: torch.FloatTensor,
                 source_lengths: torch.LongTensor) -> Dict[str, torch.Tensor]:
         # shape: (batch_size, max_input_sequence_length, encoder_input_dim)
+        if self.vgg is not None:
+            source_features, source_lengths = self.vgg(
+                source_features, source_lengths)
+        encoder_outputs, _, source_lengths = self._encoder(
+            source_features, source_lengths)
         source_mask = util.get_mask_from_sequence_lengths(
-            source_lengths, torch.max(source_lengths))
-        encoder_outputs = self._encoder(
-            source_features, source_mask)
-
+            source_lengths, encoder_outputs.size(1))
         # shape: (batch_size, max_input_sequence_length, encoder_output_dim)
         return {
             "source_mask": source_mask,
@@ -304,6 +319,7 @@ class Seq2SeqLuong(Model):
         # shape: (batch_size, decoder_output_dim)
         state["decoder_context"] = state["encoder_outputs"].new_zeros(
             batch_size, self._decoder_output_dim)
+        state["monotonic_attention"] = None
         return state
 
     def _forward_loop(self,
@@ -341,6 +357,7 @@ class Seq2SeqLuong(Model):
 
         step_logits: List[torch.Tensor] = []
         step_predictions: List[torch.Tensor] = []
+        step_atts: List[torch.Tensor] = []
         for timestep in range(num_decoding_steps):
             if self.training and torch.rand(1).item() < self._scheduled_sampling_ratio:
                 # Use gold tokens at test time and at a rate of 1 - _scheduled_sampling_ratio
@@ -357,6 +374,10 @@ class Seq2SeqLuong(Model):
             # shape: (batch_size, num_classes)
             output_projections, state = self._prepare_output_projections(
                 input_choices, state)
+
+            # collect chunkwise attention for debug purposes.
+            # list of tensors, shape: (batch_size, sequence_length)
+            step_atts.append(state["chunkwise_attention"])
 
             # list of tensors, shape: (batch_size, 1, num_classes)
             step_logits.append(output_projections.unsqueeze(1))
@@ -375,7 +396,13 @@ class Seq2SeqLuong(Model):
         # shape: (batch_size, num_decoding_steps)
         predictions = torch.cat(step_predictions, 1)
 
-        output_dict = {"predictions": predictions}
+        # shape: (batch_size, num_decoding_steps)
+        attentions = torch.stack(step_atts, -1)
+
+        output_dict = {
+            "predictions": predictions,
+            "attentions": attentions
+        }
 
         if target_tokens:
             # shape: (batch_size, num_decoding_steps, num_classes)
@@ -430,6 +457,8 @@ class Seq2SeqLuong(Model):
         # shape: (group_size, decoder_output_dim)
         decoder_output = state["decoder_output"]
 
+        mono_att = state["monotonic_attention"]
+
         # shape: (group_size, target_embedding_dim)
         embedded_input = self._target_embedder(last_predictions)
 
@@ -444,8 +473,8 @@ class Seq2SeqLuong(Model):
 
         if self._attention:
             # shape: (group_size, encoder_output_dim)
-            attended_output = self._prepare_attended_output(
-                decoder_hidden, encoder_outputs, source_mask)
+            attended_output, mono_att, chunk_att = self._prepare_attended_output(
+                decoder_hidden, encoder_outputs, source_mask, mono_att)
 
             # shape: (group_size, decoder_output_dim)
             decoder_output = torch.tanh(
@@ -458,6 +487,8 @@ class Seq2SeqLuong(Model):
         state["decoder_hidden"] = decoder_hidden
         state["decoder_context"] = decoder_context
         state["decoder_output"] = decoder_output
+        state["monotonic_attention"] = mono_att
+        state["chunkwise_attention"] = chunk_att
 
         # shape: (group_size, num_classes)
         output_projections = self._output_projection_layer(decoder_output)
@@ -467,21 +498,27 @@ class Seq2SeqLuong(Model):
     def _prepare_attended_output(self,
                                  decoder_hidden_state: torch.LongTensor = None,
                                  encoder_outputs: torch.LongTensor = None,
-                                 encoder_outputs_mask: torch.LongTensor = None) -> torch.Tensor:
+                                 encoder_outputs_mask: torch.LongTensor = None,
+                                 prev_alpha: torch.LongTensor = None) -> torch.Tensor:
         """Apply attention over encoder outputs and decoder state."""
         # Ensure mask is also a FloatTensor. Or else the multiplication within
         # attention will complain.
         # shape: (batch_size, max_input_sequence_length)
         encoder_outputs_mask = encoder_outputs_mask.float()
+        encoder_outs: Dict[str, torch.Tensor] = {
+            "value": encoder_outputs,
+            "mask": encoder_outputs_mask
+        }
 
         # shape: (batch_size, max_input_sequence_length)
-        input_weights = self._attention(
-            decoder_hidden_state, encoder_outputs, encoder_outputs_mask)
+        att_fn = self._attention.soft if self.training else self._attention.hard
+        alpha, beta = att_fn(
+            encoder_outs, decoder_hidden_state, prev_alpha)
 
         # shape: (batch_size, encoder_output_dim)
-        attended_output = util.weighted_sum(encoder_outputs, input_weights)
+        attended_output = util.weighted_sum(encoder_outputs, beta)
 
-        return attended_output
+        return attended_output, alpha, beta
 
     @staticmethod
     def _get_loss(logits: torch.LongTensor,

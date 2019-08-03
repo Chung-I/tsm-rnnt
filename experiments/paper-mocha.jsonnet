@@ -1,14 +1,17 @@
 local BATCH_SIZE = 64;
-local FRAME_RATE = 3;
+local FRAME_RATE = 1;
 local ENCODER_HIDDEN_SIZE = 512;
 local DECODER_HIDDEN_SIZE = 512;
 {
+  "random_seed": 13370,
+  "numpy_seed": 1337,
+  "pytorch_seed": 133,
   "dataset_reader": {
     "type": "stt",
     "lazy": true,
     "shard_size": BATCH_SIZE,
     "input_stack_rate": FRAME_RATE,
-    "model_stack_rate": 2,
+    "model_stack_rate": 8,
     "target_add_start_end_token": true,
     "target_tokenizer": {
       "type": "word",
@@ -30,6 +33,7 @@ local DECODER_HIDDEN_SIZE = 512;
   "validation_data_path": "/home/nlpmaster/ssd-1t/tsm-single-npy/val",
   "model": {
     "type": "seq2seq_mocha",
+    "input_size": 80 * FRAME_RATE,
     "encoder": {
       "type": "awd-rnn",
       "input_size": 80 * FRAME_RATE,
@@ -39,7 +43,7 @@ local DECODER_HIDDEN_SIZE = 512;
       "dropouth": 0.25,
       "dropouti": 0.25,
       "wdrop": 0.1,
-      "stack_rates": [1, 1, 2, 1],
+      "stack_rates": [2, 2, 2, 1],
     },
     "max_decoding_steps": 30,
     "target_embedding_dim": DECODER_HIDDEN_SIZE,
@@ -58,7 +62,8 @@ local DECODER_HIDDEN_SIZE = 512;
       [".*weight_ih.*", {"type": "xavier_uniform"}],
       [".*weight_hh.*", {"type": "orthogonal"}],
       [".*bias_ih.*", {"type": "zero"}],
-      [".*bias_hh.*", {"type": "lstm_hidden_bias"}]
+      [".*bias_hh.*", {"type": "lstm_hidden_bias"}],
+      ["_target_embedder.weight", {"type": "uniform", "a": -1, "b": 1}],
     ]
   },
   "iterator": {
@@ -71,19 +76,19 @@ local DECODER_HIDDEN_SIZE = 512;
   "trainer": {
     "num_epochs": 300,
     "patience": 20,
-    "grad_norm": 1.0,
+    "grad_norm": 8.0,
     "cuda_device": 0,
     "validation_metric": "-WER",
-    "num_serialized_models_to_keep": 1,
+    "num_serialized_models_to_keep": 2,
     "learning_rate_scheduler": {
-      "type": "reduce_on_plateau",
-      "factor": 0.8,
-      "mode": "min",
-      "patience": 10
+      "type": "multi_step",
+      "milestones": [8, 16, 24],
+      "gamma": 0.1
     },
     "optimizer": {
       "type": "dense_sparse_adam",
-      "lr": 0.0003
+      "lr": 0.0002,
+      "eps": 1e-6
     }
   }
 }

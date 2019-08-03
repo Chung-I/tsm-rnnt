@@ -48,6 +48,7 @@ class SpeechToTextDatasetReader(DatasetReader):
     delimiter : str, (optional, default="\t")
         Set delimiter for tsv/csv file.
     """
+
     def __init__(self,
                  shard_size: int,
                  input_stack_rate: int = 1,
@@ -59,7 +60,8 @@ class SpeechToTextDatasetReader(DatasetReader):
                  lazy: bool = False) -> None:
         super().__init__(lazy)
         self._target_tokenizer = target_tokenizer or WordTokenizer()
-        self._target_token_indexers = target_token_indexers or {"tokens": SingleIdTokenIndexer()}
+        self._target_token_indexers = target_token_indexers or {
+            "tokens": SingleIdTokenIndexer()}
         self._delimiter = delimiter
         self._shard_size = shard_size
         self.input_stack_rate = input_stack_rate
@@ -76,7 +78,8 @@ class SpeechToTextDatasetReader(DatasetReader):
         with open(file_path + '.tsv', "r") as data_file:
             for line_num, row in enumerate(csv.reader(data_file, delimiter=self._delimiter)):
                 if len(row) != 4:
-                    raise ConfigurationError("Invalid line format: %s (line number %d)" % (row, line_num + 1))
+                    raise ConfigurationError(
+                        "Invalid line format: %s (line number %d)" % (row, line_num + 1))
                 rows.append(row)
 
         dataset_size = len(rows)
@@ -85,6 +88,7 @@ class SpeechToTextDatasetReader(DatasetReader):
 
         batched_indices = list(range(0, dataset_size, self._shard_size))
         random.shuffle(batched_indices)
+
         for start_idx in batched_indices:
             end_idx = min(start_idx + self._shard_size, dataset_size)
             for idx in range(start_idx, end_idx):
@@ -112,7 +116,8 @@ class SpeechToTextDatasetReader(DatasetReader):
         # pylint: disable=arguments-differ
         source_array, src_len = pad_and_stack(source_array,
                                               self.input_stack_rate,
-                                              self.model_stack_rate)
+                                              self.model_stack_rate,
+                                              pad_mode='wrap')
         source_length_field = LabelField(src_len, skip_indexing=True)
         source_field = ArrayField(source_array)
         if target_string is not None:
@@ -120,11 +125,11 @@ class SpeechToTextDatasetReader(DatasetReader):
             if self._target_add_start_end_token:
                 tokenized_target.insert(0, Token(START_SYMBOL))
                 tokenized_target.append(Token(END_SYMBOL))
-            target_field = TextField(tokenized_target, self._target_token_indexers)
+            target_field = TextField(
+                tokenized_target, self._target_token_indexers)
             return Instance({"source_features": source_field,
                              "target_tokens": target_field,
                              "source_lengths": source_length_field})
         else:
             return Instance({"source_features": source_field,
                              "source_lengths": source_length_field})
-

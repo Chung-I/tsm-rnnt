@@ -24,7 +24,7 @@ from allennlp.nn import InitializerApplicator
 from stt.training.word_error_rate import WordErrorRate as WER
 
 
-@Model.register("seq2seq_luong")
+@Model.register("awd_seq2seq_luong")
 class Seq2SeqLuong(Model):
     """
     This ``SimpleSeq2Seq`` class is a :class:`Model` which takes a sequence, encodes it, and then
@@ -279,11 +279,10 @@ class Seq2SeqLuong(Model):
                 source_features: torch.FloatTensor,
                 source_lengths: torch.LongTensor) -> Dict[str, torch.Tensor]:
         # shape: (batch_size, max_input_sequence_length, encoder_input_dim)
+        encoder_outputs, _, source_lengths = self._encoder(
+            source_features, source_lengths)
         source_mask = util.get_mask_from_sequence_lengths(
             source_lengths, torch.max(source_lengths))
-        encoder_outputs = self._encoder(
-            source_features, source_mask)
-
         # shape: (batch_size, max_input_sequence_length, encoder_output_dim)
         return {
             "source_mask": source_mask,

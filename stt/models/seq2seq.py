@@ -18,14 +18,14 @@ from allennlp.modules.token_embedders import Embedding
 from allennlp.nn import util
 from allennlp.nn.beam_search import BeamSearch
 from allennlp.training.metrics import BLEU
-from allennlp.nn import InitializerApplicator 
+from allennlp.nn import InitializerApplicator
 
 
 from stt.training.word_error_rate import WordErrorRate as WER
 
 
-@Model.register("mocha")
-class MoChASeq2Seq(Model):
+@Model.register("my_seq2seq")
+class MySeq2Seq(Model):
     """
     This ``SimpleSeq2Seq`` class is a :class:`Model` which takes a sequence, encodes it, and then
     uses the encoded representations to decode another sequence.  You can use this as the basis for
@@ -84,23 +84,29 @@ class MoChASeq2Seq(Model):
                  target_namespace: str = "tokens",
                  scheduled_sampling_ratio: float = 0.,
                  initializer: InitializerApplicator = InitializerApplicator()) -> None:
-        super(MoChASeq2Seq, self).__init__(vocab)
+        super(MySeq2Seq, self).__init__(vocab)
         self._target_namespace = target_namespace
         self._scheduled_sampling_ratio = scheduled_sampling_ratio
 
         # We need the start symbol to provide as the input at the first timestep of decoding, and
         # end symbol as a way to indicate the end of the decoded sequence.
-        self._start_index = self.vocab.get_token_index(START_SYMBOL, self._target_namespace)
-        self._end_index = self.vocab.get_token_index(END_SYMBOL, self._target_namespace)
+        self._start_index = self.vocab.get_token_index(
+            START_SYMBOL, self._target_namespace)
+        self._end_index = self.vocab.get_token_index(
+            END_SYMBOL, self._target_namespace)
 
-        pad_index = self.vocab.get_token_index(self.vocab._padding_token, self._target_namespace)  # pylint: disable=protected-access
-        self._bleu = BLEU(exclude_indices={pad_index, self._end_index, self._start_index})
-        self._wer = WER(exclude_indices={pad_index, self._end_index, self._start_index})
+        pad_index = self.vocab.get_token_index(
+            self.vocab._padding_token, self._target_namespace)  # pylint: disable=protected-access
+        self._bleu = BLEU(
+            exclude_indices={pad_index, self._end_index, self._start_index})
+        self._wer = WER(exclude_indices={
+                        pad_index, self._end_index, self._start_index})
 
         # At prediction time, we use a beam search to find the most likely sequence of target tokens.
         beam_size = beam_size or 1
         self._max_decoding_steps = max_decoding_steps
-        self._beam_search = BeamSearch(self._end_index, max_steps=max_decoding_steps, beam_size=beam_size)
+        self._beam_search = BeamSearch(
+            self._end_index, max_steps=max_decoding_steps, beam_size=beam_size)
 
         # Encodes the sequence of source embeddings into a sequence of hidden states.
         self._encoder = encoder
@@ -138,11 +144,13 @@ class MoChASeq2Seq(Model):
         # We'll use an LSTM cell as the recurrent cell that produces a hidden state
         # for the decoder at each time step.
         # TODO (pradeep): Do not hardcode decoder cell type.
-        self._decoder_cell = LSTMCell(self._decoder_input_dim, self._decoder_output_dim)
+        self._decoder_cell = LSTMCell(
+            self._decoder_input_dim, self._decoder_output_dim)
 
         # We project the hidden state from the decoder into the output vocabulary space
         # in order to get log probabilities of each target token, at each time step.
-        self._output_projection_layer = Linear(self._decoder_output_dim, num_classes)
+        self._output_projection_layer = Linear(
+            self._decoder_output_dim, num_classes)
 
         initializer(self)
 
@@ -180,7 +188,8 @@ class MoChASeq2Seq(Model):
             for each source sentence in the batch.
         """
         # shape: (group_size, num_classes)
-        output_projections, state = self._prepare_output_projections(last_predictions, state)
+        output_projections, state = self._prepare_output_projections(
+            last_predictions, state)
 
         # shape: (group_size, num_classes)
         class_log_probabilities = F.log_softmax(output_projections, dim=-1)
@@ -268,26 +277,29 @@ class MoChASeq2Seq(Model):
                 source_features: torch.FloatTensor,
                 source_lengths: torch.LongTensor) -> Dict[str, torch.Tensor]:
         # shape: (batch_size, max_input_sequence_length, encoder_input_dim)
-        encoder_outputs, _, source_lengths = self._encoder(source_features, source_lengths)
-        source_mask = util.get_mask_from_sequence_lengths(source_lengths, torch.max(source_lengths))
+        encoder_outputs, _, source_lengths = self._encoder(
+            source_features, source_lengths)
+        source_mask = util.get_mask_from_sequence_lengths(
+            source_lengths, torch.max(source_lengths))
         # shape: (batch_size, max_input_sequence_length, encoder_output_dim)
         return {
-                "source_mask": source_mask,
-                "encoder_outputs": encoder_outputs,
+            "source_mask": source_mask,
+            "encoder_outputs": encoder_outputs,
         }
 
     def _init_decoder_state(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         batch_size = state["source_mask"].size(0)
         # shape: (batch_size, encoder_output_dim)
         final_encoder_output = util.get_final_encoder_states(
-                state["encoder_outputs"],
-                state["source_mask"],
-                self._encoder.is_bidirectional())
+            state["encoder_outputs"],
+            state["source_mask"],
+            self._encoder.is_bidirectional())
         # Initialize the decoder hidden state with the final output of the encoder.
         # shape: (batch_size, decoder_output_dim)
         state["decoder_hidden"] = final_encoder_output
         # shape: (batch_size, decoder_output_dim)
-        state["decoder_context"] = state["encoder_outputs"].new_zeros(batch_size, self._decoder_output_dim)
+        state["decoder_context"] = state["encoder_outputs"].new_zeros(
+            batch_size, self._decoder_output_dim)
         return state
 
     def _forward_loop(self,
@@ -320,7 +332,8 @@ class MoChASeq2Seq(Model):
 
         # Initialize target predictions with the start index.
         # shape: (batch_size,)
-        last_predictions = source_mask.new_full((batch_size,), fill_value=self._start_index)
+        last_predictions = source_mask.new_full(
+            (batch_size,), fill_value=self._start_index)
 
         step_logits: List[torch.Tensor] = []
         step_predictions: List[torch.Tensor] = []
@@ -338,7 +351,8 @@ class MoChASeq2Seq(Model):
                 input_choices = targets[:, timestep]
 
             # shape: (batch_size, num_classes)
-            output_projections, state = self._prepare_output_projections(input_choices, state)
+            output_projections, state = self._prepare_output_projections(
+                input_choices, state)
 
             # list of tensors, shape: (batch_size, 1, num_classes)
             step_logits.append(output_projections.unsqueeze(1))
@@ -373,16 +387,17 @@ class MoChASeq2Seq(Model):
     def _forward_beam_search(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Make forward pass during prediction using a beam search."""
         batch_size = state["source_mask"].size()[0]
-        start_predictions = state["source_mask"].new_full((batch_size,), fill_value=self._start_index)
+        start_predictions = state["source_mask"].new_full(
+            (batch_size,), fill_value=self._start_index)
 
         # shape (all_top_k_predictions): (batch_size, beam_size, num_decoding_steps)
         # shape (log_probabilities): (batch_size, beam_size)
         all_top_k_predictions, log_probabilities = self._beam_search.search(
-                start_predictions, state, self.take_step)
+            start_predictions, state, self.take_step)
 
         output_dict = {
-                "class_log_probabilities": log_probabilities,
-                "predictions": all_top_k_predictions,
+            "class_log_probabilities": log_probabilities,
+            "predictions": all_top_k_predictions,
         }
         return output_dict
 
@@ -413,7 +428,8 @@ class MoChASeq2Seq(Model):
 
         if self._attention:
             # shape: (group_size, encoder_output_dim)
-            attended_input = self._prepare_attended_input(decoder_hidden, encoder_outputs, source_mask)
+            attended_input = self._prepare_attended_input(
+                decoder_hidden, encoder_outputs, source_mask)
 
             # shape: (group_size, decoder_output_dim + target_embedding_dim)
             decoder_input = torch.cat((attended_input, embedded_input), -1)
@@ -424,8 +440,8 @@ class MoChASeq2Seq(Model):
         # shape (decoder_hidden): (batch_size, decoder_output_dim)
         # shape (decoder_context): (batch_size, decoder_output_dim)
         decoder_hidden, decoder_context = self._decoder_cell(
-                decoder_input,
-                (decoder_hidden, decoder_context))
+            decoder_input,
+            (decoder_hidden, decoder_context))
 
         state["decoder_hidden"] = decoder_hidden
         state["decoder_context"] = decoder_context
@@ -447,7 +463,7 @@ class MoChASeq2Seq(Model):
 
         # shape: (batch_size, max_input_sequence_length)
         input_weights = self._attention(
-                decoder_hidden_state, encoder_outputs, encoder_outputs_mask)
+            decoder_hidden_state, encoder_outputs, encoder_outputs_mask)
 
         # shape: (batch_size, encoder_output_dim)
         attended_input = util.weighted_sum(encoder_outputs, input_weights)

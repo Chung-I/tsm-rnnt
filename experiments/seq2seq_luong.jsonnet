@@ -1,6 +1,6 @@
 local BATCH_SIZE = 64;
 local FRAME_RATE = 3;
-local ENCODER_HIDDEN_SIZE = 512;
+local ENCODER_HIDDEN_SIZE = 256;
 local DECODER_HIDDEN_SIZE = 512;
 {
   "dataset_reader": {
@@ -29,27 +29,21 @@ local DECODER_HIDDEN_SIZE = 512;
   "train_data_path": "/home/nlpmaster/ssd-1t/tsm-single-npy/train",
   "validation_data_path": "/home/nlpmaster/ssd-1t/tsm-single-npy/val",
   "model": {
-    "type": "seq2seq_mocha",
+    "type": "seq2seq_luong",
     "encoder": {
-      "type": "awd-rnn",
+      "type": "lstm",
       "input_size": 80 * FRAME_RATE,
       "hidden_size": ENCODER_HIDDEN_SIZE,
       "num_layers": 4,
-      "dropout": 0.25,
-      "dropouth": 0.25,
-      "dropouti": 0.25,
-      "wdrop": 0.1,
-      "stack_rates": [1, 1, 2, 1],
+      "bidirectional": true
     },
     "max_decoding_steps": 30,
     "target_embedding_dim": DECODER_HIDDEN_SIZE,
     "beam_size": 5,
     "attention": {
-      "type": "mocha",
-      "chunk_size": 6,
-      "enc_dim": ENCODER_HIDDEN_SIZE,
-      "dec_dim": DECODER_HIDDEN_SIZE,
-      "att_dim": DECODER_HIDDEN_SIZE
+      "type": "bilinear",
+      "vector_dim": DECODER_HIDDEN_SIZE,
+      "matrix_dim": ENCODER_HIDDEN_SIZE
     },
     "target_namespace": "target_tokens",
     "initializer": [
@@ -71,7 +65,7 @@ local DECODER_HIDDEN_SIZE = 512;
   "trainer": {
     "num_epochs": 300,
     "patience": 20,
-    "grad_norm": 1.0,
+    "grad_clipping": 10.0,
     "cuda_device": 0,
     "validation_metric": "-WER",
     "num_serialized_models_to_keep": 1,
