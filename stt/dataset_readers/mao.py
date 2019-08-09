@@ -1,10 +1,12 @@
 import csv
-from typing import Dict, Iterable
+from typing import Dict, Iterable, List, Tuple
 import logging
 import random
 import numpy as np
-
+import os
+from opencc import OpenCC
 from overrides import overrides
+import re
 
 import kaldi_io
 from allennlp.common.checks import ConfigurationError
@@ -15,12 +17,12 @@ from allennlp.data.instance import Instance
 from allennlp.data.tokenizers import Tokenizer, WordTokenizer, Token
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
 
-from stt.dataset_readers.utils import pad_and_stack
+from stt.dataset_readers.utils import pad_and_stack, process_phone, word_to_phones
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
-@DatasetReader.register("stt")
+@DatasetReader.register("mao-stt")
 class SpeechToTextDatasetReader(DatasetReader):
     """
     Read a tsv file containing paired sequences, and create a dataset suitable for a
@@ -51,12 +53,16 @@ class SpeechToTextDatasetReader(DatasetReader):
 
     def __init__(self,
                  shard_size: int,
+                 lexicon_path: str = None,
                  input_stack_rate: int = 1,
                  model_stack_rate: int = 1,
-                 target_add_start_end_token: bool = False,
+                 max_frames: int = 1000,
                  target_tokenizer: Tokenizer = None,
                  target_token_indexers: Dict[str, TokenIndexer] = None,
+                 target_add_start_end_token: bool = False,
                  delimiter: str = "\t",
+                 curriculum: List[Tuple[int, int]] = None,
+                 bucket: bool = False,
                  lazy: bool = False) -> None:
         super().__init__(lazy)
         self._target_tokenizer = target_tokenizer or WordTokenizer()
@@ -67,7 +73,21 @@ class SpeechToTextDatasetReader(DatasetReader):
         self.input_stack_rate = input_stack_rate
         self.model_stack_rate = model_stack_rate
         self._target_add_start_end_token = target_add_start_end_token
-        self.pad_mode = "wrap" if input_stack_rate == 1 else "constant"
+        self._pad_mode = "wrap" if input_stack_rate == 1 else "constant"
+        self._bucket = bucket
+        self._max_frames = max_frames
+        self._curriculum = curriculum
+        self._epoch_num = 0
+
+        self.lexicon: Dict[str, str] = {}
+        if lexicon_path is not None:
+            with open(lexicon_path) as f:
+                for line in f.read().splitlines():
+                    end, start = re.search(r'\s+', line).span()
+                    self.lexicon[line[:end]] = line[start:]
+
+        self.cc = OpenCC('s2t')
+        self.w2p = word_to_phones(self.lexicon)
 
     @overrides
     def _read(self, file_path: str) -> Iterable[Instance]:
@@ -75,43 +95,51 @@ class SpeechToTextDatasetReader(DatasetReader):
         logger.info('Loading data from %s', file_path)
         dropped_instances = 0
 
-        rows = []
-        with open(file_path + '.tsv', "r") as data_file:
-            for line_num, row in enumerate(csv.reader(data_file, delimiter=self._delimiter)):
-                if len(row) != 4:
-                    raise ConfigurationError(
-                        "Invalid line format: %s (line number %d)" % (row, line_num + 1))
-                rows.append(row)
+        source_datas = np.load(os.path.join(
+            file_path, 'data.npy'), mmap_mode='r')
+        source_lens = np.load(os.path.join(file_path, 'lens.npy'))
+        source_positions = np.pad(source_lens, pad_width=(1, 0), mode='constant') \
+            .cumsum()
+        with open(os.path.join(file_path, "trn.txt")) as f:
+            target_datas = f.read().splitlines()
 
-        dataset_size = len(rows)
+        seed = np.random.get_state()[1][0]
+        np.random.seed(seed + 1)
 
-        source_datas = np.load(file_path + '.npy', mmap_mode='r')
+        max_src_len = self.get_max_src_len()
+        print("epoch number: {}".format(self._epoch_num))
+        curriculum = max_src_len < np.inf
 
-        #seed = np.random.get_state()[1][0]
-        #np.random.seed(seed + 1)
+        source_orders = np.argsort(source_lens)
 
-        batched_indices = list(range(0, dataset_size, self._shard_size))
+        source_orders = [
+            idx for idx in source_orders if source_lens[idx] < max_src_len]
+
+        batched_indices = list(range(0, len(source_orders), self._shard_size))
         np.random.shuffle(batched_indices)
 
         for start_idx in batched_indices:
-            end_idx = min(start_idx + self._shard_size, dataset_size)
+            end_idx = min(start_idx + self._shard_size, len(source_orders))
             for idx in range(start_idx, end_idx):
-                data = rows[idx]
-                src = source_datas[int(data[-2]):int(data[-1])]
-                tgt = data[1]
+                if self._bucket or curriculum:
+                    idx = source_orders[idx]
+                start, end = source_positions[idx], source_positions[idx+1]
+                src = source_datas[start:end]
+                tgt = target_datas[idx]
                 instance = self.text_to_instance(src, tgt)
                 tgt_len = instance.fields['target_tokens'].sequence_length()
-                if tgt_len < 1:
+                if tgt_len < 1 + (2 if self._target_add_start_end_token else 0) \
+                        or src.shape[0] > self._max_frames:
                     dropped_instances += 1
                 else:
                     yield instance
-                del data
                 del instance
         if not dropped_instances:
             logger.info("No instances dropped from {}.".format(file_path))
         else:
             logger.warning("Dropped {} instances from {}.".format(dropped_instances,
                                                                   file_path))
+        self._epoch_num += 1
 
     @overrides
     def text_to_instance(self,
@@ -121,19 +149,45 @@ class SpeechToTextDatasetReader(DatasetReader):
         source_array, src_len = pad_and_stack(source_array,
                                               self.input_stack_rate,
                                               self.model_stack_rate,
-                                              pad_mode=self.pad_mode)
+                                              pad_mode=self._pad_mode)
         source_length_field = LabelField(src_len, skip_indexing=True)
         source_field = ArrayField(source_array)
+
         if target_string is not None:
-            tokenized_target = self._target_tokenizer.tokenize(target_string)
-            if self._target_add_start_end_token:
-                tokenized_target.insert(0, Token(START_SYMBOL))
-                tokenized_target.append(Token(END_SYMBOL))
+            if not self.lexicon:
+                target_string = " ".join(list(target_string.strip()))
+                target = self._target_tokenizer.tokenize(target_string)
+                if self._target_add_start_end_token:
+                    target.insert(0, Token(START_SYMBOL))
+                    target.append(Token(END_SYMBOL))
+            else:
+                tokenized_target = self._target_tokenizer.tokenize(
+                    target_string)
+                phonemized_target: List[str] = []
+                for word in tokenized_target:
+                    word = self.cc.convert(word.text)
+                    phonemized_target.extend(self.w2p(word))
+
+                if self._target_add_start_end_token:
+                    phonemized_target.insert(0, START_SYMBOL)
+                    phonemized_target.append(END_SYMBOL)
+                target = [Token(x) for x in phonemized_target]
+
             target_field = TextField(
-                tokenized_target, self._target_token_indexers)
+                target, self._target_token_indexers)
             return Instance({"source_features": source_field,
                              "target_tokens": target_field,
                              "source_lengths": source_length_field})
         else:
             return Instance({"source_features": source_field,
                              "source_lengths": source_length_field})
+
+    def get_max_src_len(self):
+        max_len = np.inf
+        if self._curriculum is not None:
+            for epoch, cur_max_len in self._curriculum:
+                if self._epoch_num < epoch:
+                    break
+                max_len = cur_max_len
+
+        return max_len

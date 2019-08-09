@@ -37,13 +37,20 @@ class WordErrorRate(Metric):
         lengths: ``List[int]``, required.
             A tensor of the same shape as ``predicted_indices``.
         """
-        predictions, gold_targets = self.unwrap_to_tensors(predictions, gold_targets)
+        # predictions, gold_targets = self.unwrap_to_tensors(
+        #     predictions, gold_targets)
+
+        predictions = predictions.tolist() if not isinstance(
+            predictions, list) else predictions
+
+        gold_targets = gold_targets.tolist() if not isinstance(
+            gold_targets, list) else gold_targets
 
         predictions = [list(filter(lambda idx: idx not in self._exclude_indices, prediction))
-            for prediction in predictions.tolist()]
+                       for prediction in predictions]
 
         gold_targets = [list(filter(lambda idx: idx not in self._exclude_indices, gold_target))
-            for gold_target in gold_targets.tolist()]
+                        for gold_target in gold_targets]
 
         for prediction, target in zip(predictions, gold_targets):
             self._total_errors += levenshtein(prediction,
@@ -56,7 +63,7 @@ class WordErrorRate(Metric):
         -------
         The accumulated metrics as a dictionary.
         """
-        wer = self._total_errors / self._total_words
+        wer = self._total_errors / (self._total_words + 1e-8)
         if reset:
             self.reset()
         return {

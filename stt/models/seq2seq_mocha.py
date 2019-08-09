@@ -17,11 +17,12 @@ from allennlp.models.model import Model
 from allennlp.modules.token_embedders import Embedding
 from allennlp.nn import util
 from allennlp.nn.beam_search import BeamSearch
-from allennlp.training.metrics import BLEU
+from allennlp.training.metrics import BLEU, UnigramRecall
 from allennlp.nn import InitializerApplicator
 
 from stt.models.cnn import VGGExtractor
 from stt.training.word_error_rate import WordErrorRate as WER
+from stt.modules.losses import OCDLoss, OrderFreeLoss
 
 
 @Model.register("seq2seq_mocha")
@@ -79,11 +80,15 @@ class Seq2SeqMoChA(Model):
                  input_size: int,
                  target_embedding_dim: int,
                  max_decoding_steps: int,
+                 cmvn: bool = True,
+                 layerwise_pretraining: List[Tuple[int, int]] = None,
+                 pretrained_model_path: str = None,
                  in_channel: int = 1,
                  has_vgg: bool = False,
                  vgg_out_channel: int = 128,
                  attention: Attention = None,
                  attention_function: SimilarityFunction = None,
+                 loss_type: str = "nll",
                  beam_size: int = None,
                  target_namespace: str = "tokens",
                  scheduled_sampling_ratio: float = 0.,
@@ -107,6 +112,7 @@ class Seq2SeqMoChA(Model):
             exclude_indices={pad_index, self._end_index, self._start_index})
         self._wer = WER(exclude_indices={
             pad_index, self._end_index, self._start_index})
+        self._unigram_recall = UnigramRecall()
 
         # At prediction time, we use a beam search to find the most likely sequence of target tokens.
         beam_size = beam_size or 1
@@ -163,9 +169,27 @@ class Seq2SeqMoChA(Model):
         # in order to get log probabilities of each target token, at each time step.
         self._output_projection_layer = Linear(
             self._decoder_output_dim, num_classes)
-        self.input_bn = torch.nn.BatchNorm1d(self.input_size)
+
+        self._input_bn = None
+        if cmvn:
+            self._input_bn = torch.nn.BatchNorm1d(self.input_size)
+
+        self._epoch_num = float("inf")
+        self._layerwise_pretraining = layerwise_pretraining
+        self.output_layer_num = self._encoder.num_layers
+
+        self._loss = None
+        if loss_type == "ocd":
+            self._loss = OCDLoss(self._end_index, 1e-7, 1e-7, 5)
+        elif loss_type == "order_free":
+            self._loss = OrderFreeLoss(self._end_index)
 
         initializer(self)
+        if pretrained_model_path is not None:
+            pretrained_model = torch.load(pretrained_model_path)
+            self.load_state_dict(
+                pretrained_model, strict=False)
+            del pretrained_model
 
     def take_step(self,
                   last_predictions: torch.Tensor,
@@ -213,7 +237,8 @@ class Seq2SeqMoChA(Model):
     def forward(self,  # type: ignore
                 source_features: torch.FloatTensor,
                 source_lengths: torch.LongTensor,
-                target_tokens: Dict[str, torch.LongTensor] = None) -> Dict[str, torch.Tensor]:
+                target_tokens: Dict[str, torch.LongTensor] = None,
+                epoch_num=None) -> Dict[str, torch.Tensor]:
         # pylint: disable=arguments-differ
         """
         Make foward pass with decoder logic for producing the entire target sequence.
@@ -231,8 +256,13 @@ class Seq2SeqMoChA(Model):
         -------
         Dict[str, torch.Tensor]
         """
-        source_features = self.input_bn(
-            source_features.transpose(-2, -1)).transpose(-2, -1)
+        if epoch_num is not None:
+            self._epoch_num = epoch_num[0]
+        self.set_output_layer_num()
+
+        if self._input_bn is not None:
+            source_features = self._input_bn(
+                source_features.transpose(-2, -1)).transpose(-2, -1)
         state = self._encode(source_features, source_lengths)
 
         if target_tokens:
@@ -252,8 +282,11 @@ class Seq2SeqMoChA(Model):
                 top_k_predictions = output_dict["predictions"]
                 # shape: (batch_size, max_predicted_sequence_length)
                 best_predictions = top_k_predictions[:, 0, :]
+                target_mask = util.get_text_field_mask(target_tokens)
                 self._bleu(best_predictions, target_tokens["tokens"])
                 self._wer(best_predictions, target_tokens["tokens"])
+                self._unigram_recall(top_k_predictions, target_tokens["tokens"],
+                                     target_mask)
 
         return output_dict
 
@@ -296,7 +329,7 @@ class Seq2SeqMoChA(Model):
             source_features, source_lengths = self.vgg(
                 source_features, source_lengths)
         encoder_outputs, _, source_lengths = self._encoder(
-            source_features, source_lengths)
+            source_features, source_lengths, self.output_layer_num)
         source_mask = util.get_mask_from_sequence_lengths(
             source_lengths, encoder_outputs.size(1))
         # shape: (batch_size, max_input_sequence_length, encoder_output_dim)
@@ -410,7 +443,7 @@ class Seq2SeqMoChA(Model):
 
             # Compute loss.
             target_mask = util.get_text_field_mask(target_tokens)
-            loss = self._get_loss(logits, targets, target_mask)
+            loss = self._get_loss(logits, predictions, targets, target_mask)
             output_dict["loss"] = loss
 
         return output_dict
@@ -511,17 +544,19 @@ class Seq2SeqMoChA(Model):
         }
 
         # shape: (batch_size, max_input_sequence_length)
-        att_fn = self._attention.soft if self.training else self._attention.hard
-        alpha, beta = att_fn(
-            encoder_outs, decoder_hidden_state, prev_alpha)
+        mode = "soft" if self.training else "hard"
+        alpha, beta = self._attention(
+            encoder_outs, decoder_hidden_state, prev_alpha, mode=mode)
 
         # shape: (batch_size, encoder_output_dim)
         attended_output = util.weighted_sum(encoder_outputs, beta)
 
         return attended_output, alpha, beta
 
-    @staticmethod
-    def _get_loss(logits: torch.LongTensor,
+    # @staticmethod
+    def _get_loss(self,
+                  logits: torch.FloatTensor,
+                  predictions: torch.LongTensor,
                   targets: torch.LongTensor,
                   target_mask: torch.LongTensor) -> torch.Tensor:
         """
@@ -555,6 +590,13 @@ class Seq2SeqMoChA(Model):
         # shape: (batch_size, num_decoding_steps)
         relevant_mask = target_mask[:, 1:].contiguous()
 
+        if self._loss is not None:
+            if isinstance(self._loss, OCDLoss):
+                self._loss.update_temperature(self._epoch_num)
+
+            log_probs = F.log_softmax(logits, dim=-1).transpose(1, 0)
+            return self._loss(log_probs, predictions.transpose(1, 0), targets)
+
         return util.sequence_cross_entropy_with_logits(logits, relevant_targets, relevant_mask)
 
     @overrides
@@ -563,4 +605,15 @@ class Seq2SeqMoChA(Model):
         if not self.training:
             all_metrics.update(self._bleu.get_metric(reset=reset))
             all_metrics.update(self._wer.get_metric(reset=reset))
+            all_metrics["UR"] = self._unigram_recall.get_metric(reset=reset)
         return all_metrics
+
+    def set_output_layer_num(self):
+        output_layer_num = self._encoder.num_layers
+        if self._layerwise_pretraining is not None:
+            for epoch, layer_num in self._layerwise_pretraining:
+                if self._epoch_num < epoch:
+                    break
+                output_layer_num = layer_num
+        self.output_layer_num = output_layer_num
+        return output_layer_num

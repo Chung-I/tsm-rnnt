@@ -73,15 +73,20 @@ local DECODER_HIDDEN_SIZE = 512;
     "cuda_device": 0,
     "validation_metric": "-WER",
     "num_serialized_models_to_keep": 1,
+    // "learning_rate_scheduler": {
+    //   "type": "reduce_on_plateau",
+    //   "factor": 0.5,
+    //   "mode": "min",
+    //   "patience": 10
+    // },
     "learning_rate_scheduler": {
-      "type": "reduce_on_plateau",
-      "factor": 0.8,
-      "mode": "min",
-      "patience": 10
+      "type": "multi_step",
+      "milestones": [10, 20, 30],
+      "gamma": 0.5,
     },
     "optimizer": {
       "type": "dense_sparse_adam",
-      "lr": 0.0003
+      "lr": 0.0001
     }
   }
 }

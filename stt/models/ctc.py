@@ -1,4 +1,4 @@
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Tuple, Any
 
 import os
 import numpy
@@ -57,7 +57,10 @@ class CTCModel(Model):
 
     def __init__(self, vocab: Vocabulary,
                  encoder: Seq2SeqEncoder,
+                 input_size: int,
+                 cmvn: bool = True,
                  loss_type: str = "ctc",
+                 layerwise_pretraining: List[Tuple[int, int]] = None,
                  beam_size: int = 5,
                  target_namespace: str = "target_tokens",
                  vocab_path: str = "phonemes/vocabulary",
@@ -68,6 +71,7 @@ class CTCModel(Model):
 
         self._target_namespace = target_namespace
         self.num_classes = self.vocab.get_vocab_size(target_namespace)
+        self.input_size = input_size
         self.encoder = encoder
         self._verbose_metrics = verbose_metrics
         self.projection_layer = TimeDistributed(Linear(encoder.get_output_dim(),
@@ -77,9 +81,19 @@ class CTCModel(Model):
         self._loss_type = loss_type
         if self._loss_type == "ctc":
             self._loss = CTCLoss(blank=self._blank_idx, zero_infinity=True)
+        elif self._loss_type == "warp_ctc":
+            from warpctc_pytorch import CTCLoss as WarpCTCLoss
+            self._loss = WarpCTCLoss(
+                blank=self._blank_idx, length_average=True)
         elif self._loss_type == "rnnt":
             from warprnnt_pytorch import RNNTLoss
             self._loss = RNNTLoss(blank=self._blank_idx)
+
+        self._layerwise_pretraining = layerwise_pretraining
+
+        self._input_bn = None
+        if cmvn:
+            self._input_bn = torch.nn.BatchNorm1d(self.input_size)
 
         self._decoder = ctc_beam_search_decoder_batch
         self._alphabet = Alphabet(os.path.join(
@@ -95,7 +109,7 @@ class CTCModel(Model):
                 source_features: torch.FloatTensor,
                 source_lengths: torch.LongTensor,
                 target_tokens: Dict[str, torch.LongTensor] = None,
-                metadata: List[Dict[str, Any]] = None) -> Dict[str, torch.Tensor]:
+                epoch_num=None) -> Dict[str, torch.Tensor]:
         # pylint: disable=arguments-differ
         """
         Parameters
@@ -129,25 +143,46 @@ class CTCModel(Model):
 
         """
         target_mask = get_text_field_mask(target_tokens)
+        epoch_num = epoch_num[0]
+        output_layer_num = self.get_output_layer_num(epoch_num)
+
+        if self._input_bn is not None:
+            source_features = self._input_bn(
+                source_features.transpose(-2, -1)).transpose(-2, -1)
+
         encoded_features, _, source_lengths = self.encoder(
-            source_features, source_lengths)
+            source_features, source_lengths, output_layer_num)
+        # source_mask = get_mask_from_sequence_lengths(
+        #     source_lengths, torch.max(source_lengths))
+        # encoded_features = self.encoder(source_features, source_mask)
         batch_size, src_out_len, _ = encoded_features.size()
 
         logits = self.projection_layer(encoded_features)
-        if self._loss_type == "ctc":
+        if "ctc" in self._loss_type:
             reshaped_logits = logits.view(-1, self.num_classes)
-            log_probs = F.log_softmax(reshaped_logits, dim=-1).view([batch_size,
-                                                                     src_out_len,
-                                                                     self.num_classes])
+            log_probs = F.log_softmax(reshaped_logits, dim=-1).view(batch_size,
+                                                                    src_out_len,
+                                                                    self.num_classes)
 
         output_dict = {}
         target_lengths = get_lengths_from_binary_sequence_mask(target_mask)
+        print(target_lengths)
         if target_tokens is not None:
-            inputs = log_probs if self._loss_type == "ctc" else logits
+            if self._loss_type == "ctc":
+                inputs = log_probs
+            elif self._loss_type == "warp_ctc":
+                inputs = torch.exp(log_probs)
+            elif self._loss_type == "rnnt":
+                inputs = logits
+            else:
+                raise NotImplementedError
+
+            flattened_targets = target_tokens["tokens"].masked_select(
+                target_mask.byte())
             loss = self._loss(inputs.transpose(1, 0),
-                              target_tokens["tokens"],
-                              source_lengths,
-                              target_lengths)
+                              flattened_targets.cpu(),
+                              source_lengths.cpu(),
+                              target_lengths.cpu())
             output_dict["loss"] = loss
             if not self.training:
                 probs = torch.exp(log_probs)
@@ -158,8 +193,7 @@ class CTCModel(Model):
                 batch_best_results = [
                     beam_results[0][1] for beam_results in batch_beam_results
                 ]
-                self._wer(batch_best_results, target_tokens["tokens"].tolist(),
-                          target_lengths.tolist())
+                self._wer(batch_best_results, target_tokens["tokens"])
 
         return output_dict
 
@@ -184,6 +218,15 @@ class CTCModel(Model):
             all_tags.append(tags)
         output_dict['tags'] = all_tags
         return output_dict
+
+    def get_output_layer_num(self, epoch_num):
+        output_layer_num = self.encoder.num_layers
+        if self._layerwise_pretraining is not None:
+            for epoch, layer_num in self._layerwise_pretraining:
+                if epoch_num < epoch:
+                    break
+                output_layer_num = layer_num
+        return output_layer_num
 
     @overrides
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:

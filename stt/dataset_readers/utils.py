@@ -2,6 +2,30 @@ from typing import Tuple
 
 import math
 import numpy as np
+import re
+
+
+def process_phone(phone, remove_tone=True):
+    if remove_tone:
+        phone = re.sub("\d+", "", phone)
+    return phone
+
+
+def word_to_phones(lexicon):
+    def w2p(word):
+        phones = []
+        try:
+            phones.extend(re.split("\s+", lexicon[word]))
+        except KeyError:
+            for char in word:
+                try:
+                    phones.extend(re.split("\s+", lexicon[char]))
+                except KeyError:
+                    pass
+        phones = [process_phone(phone) for phone in phones]
+        return phones
+
+    return w2p
 
 
 def pad_and_stack(array: np.ndarray,
@@ -38,7 +62,7 @@ def pad_and_stack(array: np.ndarray,
             pad_width = (-frame_len) % total_rate
             padded_array = np.pad(
                 array, ((0, pad_width), (0, 0)), mode=pad_mode)
-        new_shape = (frame_len + pad_width // input_stack_rate,
+        new_shape = ((frame_len + pad_width) // input_stack_rate,
                      feat_dim * input_stack_rate)
         new_len = math.ceil(frame_len / input_stack_rate)
         stacked_array = padded_array.reshape(new_shape)

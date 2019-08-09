@@ -20,7 +20,6 @@ from allennlp.nn.beam_search import BeamSearch
 from allennlp.training.metrics import BLEU
 from allennlp.nn import InitializerApplicator
 
-
 from stt.training.word_error_rate import WordErrorRate as WER
 
 

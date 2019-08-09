@@ -101,10 +101,13 @@ class AWDRNN(Seq2SeqEncoder):
 
     def forward(self,
                 emb: torch.Tensor,
-                lengths: torch.Tensor):
+                lengths: torch.Tensor,
+                output_layer_num: int = None):
         emb = emb.transpose(1, 0)
         batch_size = emb.size(1)
         hidden = self.init_hidden(batch_size)
+        if output_layer_num is None:
+            output_layer_num = len(self.rnns)
 
         emb = self.lockdrop(emb, self.dropouti)
 
@@ -113,12 +116,13 @@ class AWDRNN(Seq2SeqEncoder):
         # raw_output, hidden = self.rnn(emb, hidden)
         raw_outputs = []
         outputs = []
-        for l, rnn in enumerate(self.rnns):
+        for l, rnn in enumerate(self.rnns[:output_layer_num]):
             rnn_out, lengths = rnn(raw_output, hidden[l], lengths)
             raw_output, new_h = rnn_out
             new_hidden.append(new_h)
             raw_outputs.append(raw_output)
-            if l != self.num_layers - 1:
+            # if l != self.num_layers - 1:
+            if l != output_layer_num - 1:
                 # self.hdrop(raw_output)
                 raw_output = self.lockdrop(raw_output, self.dropouth)
                 outputs.append(raw_output)

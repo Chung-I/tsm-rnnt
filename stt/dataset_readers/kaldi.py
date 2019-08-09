@@ -16,32 +16,9 @@ from allennlp.data.instance import Instance
 from allennlp.data.tokenizers import Tokenizer, WordTokenizer, Token
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
 
-from stt.dataset_readers.utils import pad_and_stack
+from stt.dataset_readers.utils import pad_and_stack, process_phone, word_to_phones
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
-
-
-def process_phone(phone, remove_tone=True):
-    if remove_tone:
-        phone = re.sub("\d+", "", phone)
-    return phone
-
-
-def word_to_phones(lexicon):
-    def w2p(word):
-        phones = []
-        try:
-            phones.extend(re.split("\s+", lexicon[word]))
-        except KeyError:
-            for char in word:
-                try:
-                    phones.extend(re.split("\s+", lexicon[char]))
-                except KeyError:
-                    pass
-        phones = [process_phone(phone) for phone in phones]
-        return phones
-
-    return w2p
 
 
 @DatasetReader.register("kaldi-stt")
