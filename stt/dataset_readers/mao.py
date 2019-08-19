@@ -8,6 +8,7 @@ from opencc import OpenCC
 from overrides import overrides
 import re
 
+
 import kaldi_io
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import START_SYMBOL, END_SYMBOL
@@ -54,14 +55,16 @@ class SpeechToTextDatasetReader(DatasetReader):
     def __init__(self,
                  shard_size: int,
                  lexicon_path: str = None,
+                 is_phone: bool = False,
                  input_stack_rate: int = 1,
                  model_stack_rate: int = 1,
-                 max_frames: int = 1000,
+                 max_frames: int = 3000,
                  target_tokenizer: Tokenizer = None,
                  target_token_indexers: Dict[str, TokenIndexer] = None,
                  target_add_start_end_token: bool = False,
                  delimiter: str = "\t",
                  curriculum: List[Tuple[int, int]] = None,
+                 mmap: bool = True,
                  bucket: bool = False,
                  lazy: bool = False) -> None:
         super().__init__(lazy)
@@ -72,12 +75,14 @@ class SpeechToTextDatasetReader(DatasetReader):
         self._shard_size = shard_size
         self.input_stack_rate = input_stack_rate
         self.model_stack_rate = model_stack_rate
+        self.stack_rate = input_stack_rate * model_stack_rate
         self._target_add_start_end_token = target_add_start_end_token
         self._pad_mode = "wrap" if input_stack_rate == 1 else "constant"
         self._bucket = bucket
         self._max_frames = max_frames
         self._curriculum = curriculum
         self._epoch_num = 0
+        self._mmap = mmap
 
         self.lexicon: Dict[str, str] = {}
         if lexicon_path is not None:
@@ -88,26 +93,26 @@ class SpeechToTextDatasetReader(DatasetReader):
 
         self.cc = OpenCC('s2t')
         self.w2p = word_to_phones(self.lexicon)
+        self._is_phone = is_phone
 
     @overrides
     def _read(self, file_path: str) -> Iterable[Instance]:
         # pylint: disable=arguments-differ
         logger.info('Loading data from %s', file_path)
         dropped_instances = 0
-
-        source_datas = np.load(os.path.join(
-            file_path, 'data.npy'), mmap_mode='r')
+        if self._mmap:
+            source_datas = np.load(os.path.join(
+                file_path, 'data.npy'), mmap_mode='r')
+        else:
+            source_datas = np.load(os.path.join(
+                file_path, 'data.npy'))
         source_lens = np.load(os.path.join(file_path, 'lens.npy'))
         source_positions = np.pad(source_lens, pad_width=(1, 0), mode='constant') \
             .cumsum()
         with open(os.path.join(file_path, "trn.txt")) as f:
             target_datas = f.read().splitlines()
 
-        seed = np.random.get_state()[1][0]
-        np.random.seed(seed + 1)
-
         max_src_len = self.get_max_src_len()
-        print("epoch number: {}".format(self._epoch_num))
         curriculum = max_src_len < np.inf
 
         source_orders = np.argsort(source_lens)
@@ -128,8 +133,8 @@ class SpeechToTextDatasetReader(DatasetReader):
                 tgt = target_datas[idx]
                 instance = self.text_to_instance(src, tgt)
                 tgt_len = instance.fields['target_tokens'].sequence_length()
-                if tgt_len < 1 + (2 if self._target_add_start_end_token else 0) \
-                        or src.shape[0] > self._max_frames:
+                if tgt_len < 1 or src.shape[0] > self._max_frames \
+                        or (src.shape[0]//self.stack_rate) < tgt_len:
                     dropped_instances += 1
                 else:
                     yield instance
@@ -155,17 +160,16 @@ class SpeechToTextDatasetReader(DatasetReader):
 
         if target_string is not None:
             if not self.lexicon:
-                target_string = " ".join(list(target_string.strip()))
                 target = self._target_tokenizer.tokenize(target_string)
                 if self._target_add_start_end_token:
                     target.insert(0, Token(START_SYMBOL))
                     target.append(Token(END_SYMBOL))
             else:
-                tokenized_target = self._target_tokenizer.tokenize(
-                    target_string)
                 phonemized_target: List[str] = []
+                tokenized_target = [word.text for word in
+                                    self._target_tokenizer.tokenize(target_string)]
                 for word in tokenized_target:
-                    word = self.cc.convert(word.text)
+                    word = self.cc.convert(word)
                     phonemized_target.extend(self.w2p(word))
 
                 if self._target_add_start_end_token:

@@ -24,7 +24,7 @@ from allennlp.nn import InitializerApplicator
 from stt.training.word_error_rate import WordErrorRate as WER
 
 
-@Model.register("seq2seq_luong")
+@Model.register("mocha_luong")
 class Seq2SeqLuong(Model):
     """
     This ``SimpleSeq2Seq`` class is a :class:`Model` which takes a sequence, encodes it, and then

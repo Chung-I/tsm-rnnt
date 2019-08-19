@@ -3,6 +3,7 @@ from typing import Dict, List, Tuple
 import numpy
 from overrides import overrides
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.linear import Linear
 from torch.nn.modules.rnn import LSTMCell
@@ -11,7 +12,8 @@ from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import START_SYMBOL, END_SYMBOL
 from allennlp.data.vocabulary import Vocabulary
 from allennlp.modules.attention import LegacyAttention
-from allennlp.modules import Attention, TextFieldEmbedder, Seq2SeqEncoder
+from allennlp.modules import Attention, Seq2SeqEncoder
+from allennlp.modules.seq2seq_encoders.pytorch_seq2seq_wrapper import PytorchSeq2SeqWrapper
 from allennlp.modules.similarity_functions import SimilarityFunction
 from allennlp.models.model import Model
 from allennlp.modules.token_embedders import Embedding
@@ -21,8 +23,10 @@ from allennlp.training.metrics import BLEU, UnigramRecall
 from allennlp.nn import InitializerApplicator
 
 from stt.models.cnn import VGGExtractor
+from stt.models.awd_rnn import AWDRNN
 from stt.training.word_error_rate import WordErrorRate as WER
-from stt.modules.losses import OCDLoss, OrderFreeLoss
+from stt.modules.losses import OCDLoss, maybe_sample_from_candidates
+from stt.modules.losses import target_to_candidates
 
 
 @Model.register("seq2seq_mocha")
@@ -91,14 +95,17 @@ class Seq2SeqMoChA(Model):
                  loss_type: str = "nll",
                  beam_size: int = None,
                  target_namespace: str = "tokens",
+                 sampling_strategy: str = "max",
+                 from_candidates: bool = False,
                  scheduled_sampling_ratio: float = 0.,
                  initializer: InitializerApplicator = InitializerApplicator()) -> None:
         super(Seq2SeqMoChA, self).__init__(vocab)
-        self.input_size = input_size
-        self.in_channel = in_channel  # 3 if has_delta and has_delta_delta
-        self.out_channel = vgg_out_channel
+        self._input_size = input_size
+        self._in_channel = in_channel  # 3 if has_delta and has_delta_delta
+        self._out_channel = vgg_out_channel
         self._target_namespace = target_namespace
         self._scheduled_sampling_ratio = scheduled_sampling_ratio
+        self._sampling_strategy = sampling_strategy
         # We need the start symbol to provide as the input at the first timestep of decoding, and
         # end symbol as a way to indicate the end of the decoded sequence.
         self._start_index = self.vocab.get_token_index(
@@ -106,12 +113,12 @@ class Seq2SeqMoChA(Model):
         self._end_index = self.vocab.get_token_index(
             END_SYMBOL, self._target_namespace)
 
-        pad_index = self.vocab.get_token_index(
+        self._pad_index = self.vocab.get_token_index(
             self.vocab._padding_token, self._target_namespace)  # pylint: disable=protected-access
         self._bleu = BLEU(
-            exclude_indices={pad_index, self._end_index, self._start_index})
+            exclude_indices={self._pad_index, self._end_index, self._start_index})
         self._wer = WER(exclude_indices={
-            pad_index, self._end_index, self._start_index})
+            self._pad_index, self._end_index, self._start_index})
         self._unigram_recall = UnigramRecall()
 
         # At prediction time, we use a beam search to find the most likely sequence of target tokens.
@@ -125,9 +132,10 @@ class Seq2SeqMoChA(Model):
 
         self.vgg = None
         if has_vgg:
-            self.vgg = VGGExtractor(self.in_channel, self.out_channel)
+            self.vgg = VGGExtractor(self._in_channel, self._out_channel)
 
         num_classes = self.vocab.get_vocab_size(self._target_namespace)
+        self._num_classes = num_classes
 
         # Attention mechanism applied to the encoder output for each step.
         if attention:
@@ -146,7 +154,11 @@ class Seq2SeqMoChA(Model):
         # Decoder output dim needs to be the same as the encoder output dim since we initialize the
         # hidden state of the decoder with the final hidden state of the encoder.
         self._encoder_output_dim = self._encoder.get_output_dim()
-        self._decoder_output_dim = self._encoder_output_dim
+        #self._decoder_output_dim = self._encoder_output_dim
+        self._decoder_output_dim = target_embedding_dim
+        if self._decoder_output_dim != self._encoder_output_dim:
+            self.bridge = nn.Linear(
+                self._encoder_output_dim, self._decoder_output_dim, bias=False)
 
         if self._attention:
             # If using attention, a weighted average over encoder outputs will be concatenated
@@ -172,17 +184,26 @@ class Seq2SeqMoChA(Model):
 
         self._input_bn = None
         if cmvn:
-            self._input_bn = torch.nn.BatchNorm1d(self.input_size)
+            self._input_bn = nn.BatchNorm1d(self._input_size)
 
         self._epoch_num = float("inf")
         self._layerwise_pretraining = layerwise_pretraining
-        self.output_layer_num = self._encoder.num_layers
+        try:
+            if isinstance(self._encoder, PytorchSeq2SeqWrapper):
+                self._num_layers = self._encoder._module.num_layers
+            else:
+                self._num_layers = self._encoder.num_layers
+        except AttributeError:
+            self._num_layers = float("inf")
+
+        self._output_layer_num = self._num_layers
 
         self._loss = None
+
+        self._from_candidates = from_candidates
         if loss_type == "ocd":
-            self._loss = OCDLoss(self._end_index, 1e-7, 1e-7, 5)
-        elif loss_type == "order_free":
-            self._loss = OrderFreeLoss(self._end_index)
+            self._loss = OCDLoss(
+                self._end_index, 1e-7, 1e-7, 5)
 
         initializer(self)
         if pretrained_model_path is not None:
@@ -328,10 +349,15 @@ class Seq2SeqMoChA(Model):
         if self.vgg is not None:
             source_features, source_lengths = self.vgg(
                 source_features, source_lengths)
-        encoder_outputs, _, source_lengths = self._encoder(
-            source_features, source_lengths, self.output_layer_num)
-        source_mask = util.get_mask_from_sequence_lengths(
-            source_lengths, encoder_outputs.size(1))
+        if not isinstance(self._encoder, AWDRNN):
+            source_mask = util.get_mask_from_sequence_lengths(
+                source_lengths, source_features.size(1))
+            encoder_outputs = self._encoder(source_features, source_mask)
+        else:
+            encoder_outputs, _, source_lengths = self._encoder(
+                source_features, source_lengths, self._output_layer_num)
+            source_mask = util.get_mask_from_sequence_lengths(
+                source_lengths, encoder_outputs.size(1))
         # shape: (batch_size, max_input_sequence_length, encoder_output_dim)
         return {
             "source_mask": source_mask,
@@ -345,6 +371,8 @@ class Seq2SeqMoChA(Model):
             state["encoder_outputs"],
             state["source_mask"],
             self._encoder.is_bidirectional())
+        if self._encoder_output_dim != self._decoder_output_dim:
+            final_encoder_output = self.bridge(final_encoder_output)
         # Initialize the decoder hidden state with the final output of the encoder.
         # shape: (batch_size, decoder_output_dim)
         state["decoder_hidden"] = final_encoder_output
@@ -371,11 +399,19 @@ class Seq2SeqMoChA(Model):
 
         batch_size = source_mask.size()[0]
 
+        candidates = None
+
         if target_tokens:
             # shape: (batch_size, max_target_sequence_length)
             targets = target_tokens["tokens"]
 
             _, target_sequence_length = targets.size()
+
+            if self._loss is not None:
+                candidates = target_to_candidates(
+                    targets, self._num_classes, ignore_indices=[self._pad_index,
+                                                                self._start_index,
+                                                                self._end_index])
 
             # The last input from the target is either padding or the end symbol.
             # Either way, we don't have to process it.
@@ -395,6 +431,9 @@ class Seq2SeqMoChA(Model):
             if self.training and torch.rand(1).item() < self._scheduled_sampling_ratio:
                 # Use gold tokens at test time and at a rate of 1 - _scheduled_sampling_ratio
                 # during training.
+                # shape: (batch_size,)
+                input_choices = last_predictions
+            elif self._loss is not None:
                 # shape: (batch_size,)
                 input_choices = last_predictions
             elif not target_tokens:
@@ -419,7 +458,12 @@ class Seq2SeqMoChA(Model):
             class_probabilities = F.softmax(output_projections, dim=-1)
 
             # shape (predicted_classes): (batch_size,)
-            _, predicted_classes = torch.max(class_probabilities, 1)
+
+            predicted_classes = maybe_sample_from_candidates(class_probabilities,
+                                                             candidates=(candidates
+                                                                         if self._from_candidates
+                                                                         else None),
+                                                             strategy=self._sampling_strategy)
 
             # shape (predicted_classes): (batch_size,)
             last_predictions = predicted_classes
@@ -443,7 +487,8 @@ class Seq2SeqMoChA(Model):
 
             # Compute loss.
             target_mask = util.get_text_field_mask(target_tokens)
-            loss = self._get_loss(logits, predictions, targets, target_mask)
+            loss = self._get_loss(logits, predictions,
+                                  targets, target_mask, candidates)
             output_dict["loss"] = loss
 
         return output_dict
@@ -558,7 +603,8 @@ class Seq2SeqMoChA(Model):
                   logits: torch.FloatTensor,
                   predictions: torch.LongTensor,
                   targets: torch.LongTensor,
-                  target_mask: torch.LongTensor) -> torch.Tensor:
+                  target_mask: torch.LongTensor,
+                  candidates: torch.LongTensor = None) -> torch.Tensor:
         """
         Compute loss.
 
@@ -595,7 +641,7 @@ class Seq2SeqMoChA(Model):
                 self._loss.update_temperature(self._epoch_num)
 
             log_probs = F.log_softmax(logits, dim=-1).transpose(1, 0)
-            return self._loss(log_probs, predictions.transpose(1, 0), targets)
+            return self._loss(log_probs, predictions.transpose(1, 0), candidates)
 
         return util.sequence_cross_entropy_with_logits(logits, relevant_targets, relevant_mask)
 
@@ -609,11 +655,11 @@ class Seq2SeqMoChA(Model):
         return all_metrics
 
     def set_output_layer_num(self):
-        output_layer_num = self._encoder.num_layers
+        output_layer_num = self._num_layers
         if self._layerwise_pretraining is not None:
             for epoch, layer_num in self._layerwise_pretraining:
                 if self._epoch_num < epoch:
                     break
                 output_layer_num = layer_num
-        self.output_layer_num = output_layer_num
+        self._output_layer_num = output_layer_num
         return output_layer_num

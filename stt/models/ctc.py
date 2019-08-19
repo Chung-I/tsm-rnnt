@@ -7,6 +7,7 @@ import torch
 from torch.nn.modules.linear import Linear
 import torch.nn.functional as F
 from torch.nn import CTCLoss
+import itertools
 
 from allennlp.common.checks import check_dimensions_match, ConfigurationError
 from allennlp.data import Vocabulary
@@ -166,7 +167,6 @@ class CTCModel(Model):
 
         output_dict = {}
         target_lengths = get_lengths_from_binary_sequence_mask(target_mask)
-        print(target_lengths)
         if target_tokens is not None:
             if self._loss_type == "ctc":
                 inputs = log_probs
@@ -177,23 +177,21 @@ class CTCModel(Model):
             else:
                 raise NotImplementedError
 
-            flattened_targets = target_tokens["tokens"].masked_select(
-                target_mask.byte())
             loss = self._loss(inputs.transpose(1, 0),
-                              flattened_targets.cpu(),
-                              source_lengths.cpu(),
-                              target_lengths.cpu())
+                              target_tokens["tokens"],
+                              source_lengths,
+                              target_lengths)
             output_dict["loss"] = loss
             if not self.training:
-                probs = torch.exp(log_probs)
-                batch_beam_results = \
-                    self._decoder(probs.tolist(), source_lengths.tolist(),
-                                  self._alphabet, self._beam_size,
-                                  self._num_processes)
-                batch_best_results = [
-                    beam_results[0][1] for beam_results in batch_beam_results
-                ]
-                self._wer(batch_best_results, target_tokens["tokens"])
+                predictions = log_probs.max(dim=-1)[1]
+                hypotheses = []
+                for prediction in predictions:
+                    prediction = [
+                        k for k, g in itertools.groupby(prediction.tolist())]
+                    hypothesis = [
+                        w for w in prediction if w != self._blank_idx]
+                    hypotheses.append(hypothesis)
+                self._wer(hypotheses, target_tokens["tokens"])
 
         return output_dict
 

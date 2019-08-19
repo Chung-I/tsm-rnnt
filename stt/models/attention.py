@@ -62,6 +62,8 @@ def moving_max(x, w):
     x = F.max_pool1d(x, kernel_size=w, stride=1).squeeze(1)
     return x
 
+def fliped_cumsum(tensor, dim=-1):
+    return torch.flip(torch.cumsum(torch.flip(tensor, dims=[dim]), dim=dim), dims=[dim])
 
 def frame(tensor, chunk_size, pad_end=False, value=0):
     if pad_end:
@@ -235,8 +237,6 @@ class MonotonicAttention(Attention, Registrable):
         Return:
             alpha [batch_size, sequence_length]
         """
-        import pdb
-        pdb.set_trace()
 
         batch_size, sequence_length, _ = encoder_outputs["value"].size()
 
@@ -279,6 +279,14 @@ class MonotonicAttention(Attention, Registrable):
             # attention: product of above     = [0, 0, 0, 1, 0, 0, 0, 0]
         return attention
 
+    @overrides
+    def forward(self, encoder_outputs, decoder_h, previous_attention=None, mode="soft"):
+        if mode not in ["soft", "recursive", "hard"]:
+            raise ValueError("Invalid forward mode {} for attention; \
+                accept only soft and hard mode".format(mode))
+        att_func = {"soft": self.soft, "recursive": self.recursive, "hard": self.hard}
+        return att_func[mode](encoder_outputs, decoder_h, previous_attention)
+
 
 @Attention.register("mocha")
 class MoChA(MonotonicAttention):
@@ -299,7 +307,7 @@ class MoChA(MonotonicAttention):
         self.unfold = nn.Unfold(kernel_size=(self.chunk_size, 1))
         self.softmax = nn.Softmax(dim=1)
 
-    def my_stable_chunkwise_attention_soft(self, emit_probs, chunk_energy):
+    def my_soft(self, emit_probs, chunk_energy):
         """
         PyTorch version of stable_chunkwise_attention in author's TF Implementation:
         https://github.com/craffel/mocha/blob/master/Demo.ipynb.
@@ -326,7 +334,7 @@ class MoChA(MonotonicAttention):
                         stride=self.chunk_size).squeeze(1)
         return beta
 
-    def stable_chunkwise_attention_soft(self, emit_probs, chunk_energy):
+    def stable_soft(self, emit_probs, chunk_energy):
         """
         PyTorch version of stable_chunkwise_attention in author's TF Implementation:
         https://github.com/craffel/mocha/blob/master/Demo.ipynb.
@@ -355,7 +363,7 @@ class MoChA(MonotonicAttention):
         beta = torch.where(beta != beta, beta.new_zeros(beta.size()), beta)
         return beta
 
-    def chunkwise_attention_soft(self, alpha, u):
+    def soft(self, alpha, u):
         """
         Args:
             alpha [batch_size, sequence_length]: emission probability in monotonic attention
@@ -383,7 +391,7 @@ class MoChA(MonotonicAttention):
                                   back=0, forward=self.chunk_size - 1)
         return beta
 
-    def chunkwise_attention_hard(self, monotonic_attention, chunk_energy):
+    def hard(self, monotonic_attention, chunk_energy):
         """
         Mask non-attended area with '-inf'
         Args:
@@ -432,20 +440,19 @@ class MoChA(MonotonicAttention):
             #alpha_rec = cuda_benchmark(super().soft_recursive, encoder_outputs, decoder_h, previous_attention)
             #alpha = cuda_benchmark(super().soft, encoder_outputs, decoder_h, previous_attention)
             #alpha_rec = super().soft_recursive(encoder_outputs, decoder_h, previous_attention)
-            alpha = super().soft(encoder_outputs, decoder_h, previous_attention)
+            alpha = super()(encoder_outputs, decoder_h, previous_attention, mode="soft")
             # sum_of_alpha = torch.sum(alpha, dim=-1)
             # assert torch.allclose(sum_of_alpha, alpha.new_ones(alpha.size(0)),
             #                       atol=1e-3,
             #                       rtol=1e-3), "{}".format(sum_of_alpha)
             chunk_energy = self.chunk_energy(encoder_outputs, decoder_h)
-            beta = self.my_stable_chunkwise_attention_soft(alpha, chunk_energy)
+            beta = self.my_soft(alpha, chunk_energy)
             return alpha, beta
 
         elif mode == "hard":
-
-            monotonic_attention = super().hard(encoder_outputs, decoder_h, previous_attention)
+            monotonic_attention = super()(encoder_outputs, decoder_h, previous_attention, mode="hard")
             chunk_energy = self.chunk_energy(encoder_outputs, decoder_h)
-            masked_energy = self.chunkwise_attention_hard(
+            masked_energy = self.hard(
                 monotonic_attention, chunk_energy)
             chunkwise_attention = self.softmax(masked_energy)
             chunkwise_attention.masked_fill_(
@@ -457,7 +464,6 @@ class MoChA(MonotonicAttention):
 @Attention.register("milk")
 class MILk(MonotonicAttention):
     def __init__(self,
-                 chunk_size: int,
                  enc_dim: int,
                  dec_dim: int,
                  att_dim: int) -> None:
@@ -467,68 +473,45 @@ class MILk(MonotonicAttention):
         https://openreview.net/forum?id=Hko85plCW
         """
         super().__init__(enc_dim, dec_dim, att_dim)
-        self.chunk_size = chunk_size
         self.chunk_energy = Energy(enc_dim, dec_dim, att_dim)
-        self.unfold = nn.Unfold(kernel_size=(self.chunk_size, 1))
         self.softmax = nn.Softmax(dim=1)
 
-    def my_stable_chunkwise_attention_soft(self, emit_probs, chunk_energy):
+    @overrides
+    def forward(self, encoder_outputs, decoder_h, previous_attention=None, mode="soft"):
+        if mode not in ["soft", "hard"]:
+            raise ValueError("Invalid forward mode {} for attention; \
+                accept only soft and hard mode".format(mode))
+        if mode == "soft":
+
+            alpha = super()(encoder_outputs, decoder_h, previous_attention, mode="soft")
+            chunk_energy = self.chunk_energy(encoder_outputs, decoder_h)
+            beta = self.soft(alpha, chunk_energy)
+            return alpha, beta
+
+        elif mode == "hard":
+            monotonic_attention = super()(encoder_outputs, decoder_h, previous_attention, mode="hard")
+            chunk_energy = self.chunk_energy(encoder_outputs, decoder_h)
+            masked_energy = self.hard(
+                monotonic_attention, chunk_energy)
+            chunkwise_attention = self.softmax(masked_energy)
+            chunkwise_attention.masked_fill_(
+                chunkwise_attention != chunkwise_attention,
+                0)  # a trick to replace nan value with 0
+            return monotonic_attention, chunkwise_attention
+
+
+    def soft(self, emit_probs, chunk_energy):
         """
-        PyTorch version of stable_chunkwise_attention in author's TF Implementation:
+        PyTorch version of MILk in author's TF Implementation:
         https://github.com/craffel/mocha/blob/master/Demo.ipynb.
         Compute chunkwise attention distribution stably by subtracting logit max.
         """
-        # framed_chunk_energy = frame(
-        #    chunk_energy, self.chunk_size, value=float("-inf"))
-        # framed_chunk_probs = F.softmax(framed_chunk_energy, dim=-1)
-        # framed_emit_probs = frame(emit_probs, self.chunk_size, pad_end=True, value)
-        pass
-
-    def stable_chunkwise_attention_soft(self, emit_probs, chunk_energy):
-        """
-        PyTorch version of stable_chunkwise_attention in author's TF Implementation:
-        https://github.com/craffel/mocha/blob/master/Demo.ipynb.
-        Compute chunkwise attention distribution stably by subtracting logit max.
-        """
-        # Compute length-chunk_size sliding max of sequences in softmax_logits (m)
-        # (batch_size, sequence_length)
-        batch_size, sequence_length = chunk_energy
-        exp_energy = torch.exp(chunk_energy)
-        cum_exp_energy = torch.cumsum(exp_energy)
-        chunk_probs = exp_energy.unsqueeze(1).repeat(
-            1,  sequence_length, 1) / cum_exp_energy.unsqueeze(1)
-        return beta
-        pass
-
-    def chunkwise_attention_soft(self, alpha, u):
-        """
-        Args:
-            alpha [batch_size, sequence_length]: emission probability in monotonic attention
-            u [batch_size, sequence_length]: chunk energy
-            chunk_size (int): window size of chunk
-        Return
-            beta [batch_size, sequence_length]: MoChA weights
-        """
-
-        # Numerical stability
-        # Divide by same exponent => doesn't affect softmax
-        u -= torch.max(u, dim=1, keepdim=True)[0]
-        exp_u = torch.exp(u)
-        # Limit range of logit
-        exp_u = torch.clamp(exp_u, min=1e-5)
-
-        # Moving sum:
-        # Zero-pad (chunk size - 1) on the left + 1D conv with filters of 1s.
-        # [batch_size, sequence_length]
-        denominators = moving_sum(exp_u,
-                                  back=self.chunk_size - 1, forward=0)
-
-        # Compute beta (MoChA weights)
-        beta = exp_u * moving_sum(alpha / denominators,
-                                  back=0, forward=self.chunk_size - 1)
-        return beta
-
-    def chunkwise_attention_hard(self, monotonic_attention, chunk_energy):
+        chunk_energy = torch.exp(chunk_energy)
+        cumulative_energy = torch.cumsum(chunk_energy, dim=-1)
+        return chunk_energy * fliped_cumsum(
+            emit_probs / cumulative_energy, dim=-1)
+    
+    def hard(self, monotonic_attention, chunk_energy):
         """
         Mask non-attended area with '-inf'
         Args:
@@ -539,50 +522,9 @@ class MILk(MonotonicAttention):
         """
         batch_size, sequence_length = monotonic_attention.size()
 
-        mask = monotonic_attention.new_tensor(monotonic_attention)
-        for i in range(1, self.chunk_size):
-            mask[:, :-i] += monotonic_attention[:, i:]
+        mask = fliped_cumsum(monotonic_attention)
 
         # mask '-inf' energy before softmax
         masked_energy = chunk_energy.masked_fill_(
             (1 - mask).byte(), -float('inf'))
         return masked_energy
-
-    def soft(self, encoder_outputs, decoder_h, previous_alpha=None):
-        """
-        Soft monotonic chunkwise attention (Train)
-        Args:
-            encoder_outputs [batch_size, sequence_length, enc_dim]
-            decoder_h [batch_size, dec_dim]
-            previous_alpha [batch_size, sequence_length]
-        Return:
-            alpha [batch_size, sequence_length]
-            beta [batch_size, sequence_length]
-        """
-        alpha = super().soft_recursive(encoder_outputs, decoder_h, previous_alpha)
-        chunk_energy = self.chunk_energy(encoder_outputs, decoder_h)
-        beta = self.stable_chunkwise_attention_soft(alpha, chunk_energy)
-        return alpha, beta
-
-    def hard(self, encoder_outputs, decoder_h, previous_attention=None):
-        """
-        Hard monotonic chunkwise attention (Test)
-        Args:
-            encoder_outputs [batch_size, sequence_length, enc_dim]
-            decoder_h [batch_size, dec_dim]
-            previous_attention [batch_size, sequence_length]
-        Return:
-            monotonic_attention [batch_size, sequence_length]: hard alpha
-            chunkwise_attention [batch_size, sequence_length]: hard beta
-        """
-        # hard attention (one-hot)
-        # [batch_size, sequence_length]
-        monotonic_attention = super().hard(encoder_outputs, decoder_h, previous_attention)
-        chunk_energy = self.chunk_energy(encoder_outputs, decoder_h)
-        masked_energy = self.chunkwise_attention_hard(
-            monotonic_attention, chunk_energy)
-        chunkwise_attention = self.softmax(masked_energy)
-        chunkwise_attention.masked_fill_(
-            chunkwise_attention != chunkwise_attention,
-            0)  # a trick to replace nan value with 0
-        return monotonic_attention, chunkwise_attention

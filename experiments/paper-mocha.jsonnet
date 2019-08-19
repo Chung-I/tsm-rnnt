@@ -63,7 +63,7 @@ local DECODER_HIDDEN_SIZE = 512;
       [".*weight_ih.*", {"type": "xavier_uniform"}],
       [".*weight_hh.*", {"type": "orthogonal"}],
       [".*bias_ih.*", {"type": "zero"}],
-      [".*bias_hh.*", {"type": "lstm_hidden_bias"}],
+      [".*bias_hh.*", {"type": "lstm_hidden_bias"}]
       # ["_target_embedder.weight", {"type": "uniform", "a": -1, "b": 1}],
     ]
   },

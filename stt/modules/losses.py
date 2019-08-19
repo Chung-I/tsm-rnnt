@@ -14,13 +14,39 @@ def as_set(targets: torch.LongTensor):
 
 def to_one_hot(y, n_dims=None):
     """ Take integer y (tensor or variable) with n dims and convert it to 1-hot representation with n+1 dims. """
-    y_tensor = y.data if isinstance(y, Variable) else y
-    y_tensor = y_tensor.type(torch.LongTensor).reshape(-1, 1)
+    y_tensor = y
+    y_tensor = y_tensor.long().reshape(-1, 1)
     n_dims = n_dims if n_dims is not None else int(torch.max(y_tensor)) + 1
-    y_one_hot = torch.zeros(y_tensor.size()[0], n_dims).scatter_(
-        1, y_tensor, 1).to(y.device)
+    y_one_hot = y.new_zeros(y_tensor.size(0),
+                            n_dims).scatter_(1, y_tensor, 1)
     y_one_hot = y_one_hot.view(*y.shape, -1)
-    return Variable(y_one_hot) if isinstance(y, Variable) else y_one_hot
+    return y_one_hot
+
+
+def target_to_candidates(targets, label_size, ignore_indices):
+    mask = targets.new_zeros((label_size))
+    for index in ignore_indices:
+        mask[index] = 1
+    targets = to_one_hot(targets, label_size).sum(dim=1)
+    one_hot_mask = mask.byte().unsqueeze(0).expand_as(targets)
+    targets = targets.masked_fill(one_hot_mask, 0)
+    return targets
+
+
+def maybe_sample_from_candidates(probs: torch.FloatTensor,
+                                 candidates: torch.LongTensor = None,
+                                 strategy="sample"):
+    assert strategy in ["sample", "max"], "strategy must be one of [sample, max], \
+        got {} instead".format(strategy)
+    if candidates is not None:
+        mask = (1 - (candidates > 0)).byte().to(probs.device)
+        probs = probs.masked_fill(mask, 0)
+    if strategy == "sample":
+        predicted_classes = probs.multinomial(1)
+    else:
+        _, predicted_classes = probs.max(1)
+
+    return predicted_classes
 
 
 class OCDLoss(nn.Module):
@@ -38,34 +64,29 @@ class OCDLoss(nn.Module):
         Inputs:
             outputs: (seq_len, batch_size, label_size)
             output_symbols : (seq_len, batch_size) index of output symbol (sampling from policy)
-            targets: (batch_size, label_size) 
+            targets: (batch_size, label_size)
         '''
         # some details:
         # directly minize specific score
         # give sos low score
         # outputs = torch.stack(outputs)
-        targets = targets.to(outputs.device)
+        # targets = targets.to(outputs.device)
 
-        #output_symbols = torch.stack(output_symbols).squeeze(2)
+        # output_symbols = torch.stack(output_symbols).squeeze(2)
         seq_len, batch_size, label_size = outputs.size()
 
-        mask = to_one_hot(outputs.new_tensor(
-            [0, 1, 2, 3]), label_size).sum(dim=0).byte()
-        targets = to_one_hot(targets, label_size).sum(dim=1)
-        targets = targets.masked_fill(mask.unsqueeze(0).expand_as(targets), 0)
         outputs_one_hot = to_one_hot(
-            output_symbols, label_size).to(outputs.device)
-        q_values = torch.zeros(
-            outputs.shape, dtype=torch.float32, device=outputs.device)
+            output_symbols, label_size)
+        q_values = outputs.new_zeros(outputs.shape)
 
-        mask = torch.ones((seq_len, batch_size),
-                          dtype=torch.float32, device=outputs.device)
+        mask = outputs.new_ones((seq_len, batch_size))
 
         q_values[0, :, :] = -1 + targets
         for i in range(1, seq_len):
             # batch_size * label_size
-            is_correct = (targets > 0).float() * outputs_one_hot[i-1, :, :]
-            targets = targets - is_correct
+            is_correct = (targets > 0).float() * \
+                outputs_one_hot[i-1, :, :].float()
+            targets = targets.float() - is_correct
             q_values[i, :, :] = q_values[i-1, :, :] - is_correct + \
                 torch.sum(is_correct, dim=1).unsqueeze(1) - 1
 
@@ -104,21 +125,22 @@ class OrderFreeLoss(nn.Module):
         Inputs:
             outputs: (seq_len, batch_size, label_size)
             output_symbols : (seq_len, batch_size) index of output symbol (sampling from policy)
-            targets: (batch_size, label_size) 
+            targets: (batch_size, label_size)
         '''
         '''
         outputs = torch.stack(outputs)
-        
+
         output_symbols = torch.stack(output_symbols).squeeze(2)
-        
+
         seq_len, batch_size, label_size = outputs.shape
-        
+
         outputs = outputs.transpose(0,1) # batch_size * seq_len * label_size
         outputs = outputs.transpose(1,2) # batch_size * label_size * seq_len
-        
-        mask = torch.ones((seq_len, batch_size), dtype = torch.float32, device = outputs.device)
-        mask[1:,:] = 1 - output_symbols[:-1,:].data.eq(self.eos_id).float() 
-        
+
+        mask = torch.ones((seq_len, batch_size),
+                          dtype = torch.float32, device = outputs.device)
+        mask[1:,:] = 1 - output_symbols[:-1,:].data.eq(self.eos_id).float()
+
         losses = self.criterion(outputs, output_symbols.transpose(0,1)) * mask
         loss = torch.sum(losses) / torch.sum(mask)
         '''
