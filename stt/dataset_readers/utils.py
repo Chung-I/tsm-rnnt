@@ -1,8 +1,11 @@
-from typing import Tuple
+from typing import Tuple, Union
 
 import math
 import numpy as np
 import re
+
+import torch
+import torch.nn.functional as F
 
 
 def process_phone(phone, remove_tone=True):
@@ -28,7 +31,7 @@ def word_to_phones(lexicon):
     return w2p
 
 
-def pad_and_stack(array: np.ndarray,
+def pad_and_stack(array: Union[np.ndarray, torch.Tensor],
                   input_stack_rate: int = 1,
                   model_stack_rate: int = 1,
                   pad_mode: str = 'wrap') -> Tuple[np.ndarray, int]:
@@ -60,8 +63,14 @@ def pad_and_stack(array: np.ndarray,
         pad_width = 0
         if frame_len % total_rate != 0:
             pad_width = (-frame_len) % total_rate
-            padded_array = np.pad(
-                array, ((0, pad_width), (0, 0)), mode=pad_mode)
+            if isinstance(array, np.ndarray):
+                padded_array = np.pad(
+                    array, ((0, pad_width), (0, 0)), mode=pad_mode)
+            else:
+                pad_mode = "circular" if pad_mode == "wrap" else pad_mode
+                padded_array = F.pad(array.transpose(1, 0).unsqueeze(0),
+                                     pad=(0, pad_width), mode=pad_mode).squeeze(0).transpose(1, 0)
+
         new_shape = ((frame_len + pad_width) // input_stack_rate,
                      feat_dim * input_stack_rate)
         new_len = math.ceil(frame_len / input_stack_rate)

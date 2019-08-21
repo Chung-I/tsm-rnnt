@@ -1,0 +1,89 @@
+initials:
+        m: m
+        n: n
+        ng: ŋ
+        p: pcl p
+        t: tcl t
+        k: kcl k
+        ph: pcl ph
+        th: tcl th
+        kh: kcl kh
+        b: b
+        g: g
+        ts: ts
+        ch: ts
+        tsi: tɕ
+        j: dz
+        ji: dʑ
+        tsh: tsh
+        chh: tsh
+        tshi: tɕh
+        s: s
+        si: ɕ
+        h: h
+        l: l
+finals:
+        m: m
+        n: n
+        ng: ŋ
+        g: g
+        p: pcl
+        t: tcl
+        k: kcl
+        h: h
+        i: i
+        inn: ĩ
+        e: e
+        enn: ẽ
+        a: a
+        ann: ã
+        u: u
+        unn: ũ
+        o: ə
+        oo: ɔ
+        onn: ɔ̃
+        om: ɔ m
+        op: ɔ pcl
+        ong: ɔ ŋ
+        ok: ɔ kcl
+        ah: a ʔ
+        annh: ã ʔ
+        ih: i ʔ
+        innh: ĩ ʔ
+        uh: u ʔ
+        unnh: ũ ʔ
+        eh: e ʔ
+        ennh: ẽ ʔ
+        oh: ə ʔ
+        ooh: ɔ ʔ
+        onnh: ɔ̃ ʔ
+        mh: m ʔ
+        ngh: ŋ ʔ
+        l: l
+        s: s
+
+twos:
+        ong: ɔ ŋ
+        ok: ɔ kcl
+        om: ɔ m
+        op: ɔ pcl
+        inn: ĩ
+        enn: ẽ
+        ann: ã
+        unn: ũ
+        oo: ɔ
+        onn: ɔ̃
+        ng: ŋ
+        ah: a ʔ
+        annh: ã ʔ
+        ih: i ʔ
+        innh: ĩ ʔ
+        uh: u ʔ
+        unnh: ũ ʔ
+        eh: e ʔ
+        ennh: ẽ ʔ
+        oh: ə ʔ
+        ooh: ɔ ʔ
+        onnh: ɔ̃ ʔ
+        mh: m ʔ
+        ngh: ŋ ʔ

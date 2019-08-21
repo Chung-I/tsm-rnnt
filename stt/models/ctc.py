@@ -7,6 +7,7 @@ import torch
 from torch.nn.modules.linear import Linear
 import torch.nn.functional as F
 from torch.nn import CTCLoss
+from torchaudio.transforms import MelSpectrogram
 import itertools
 
 from allennlp.common.checks import check_dimensions_match, ConfigurationError
@@ -81,7 +82,7 @@ class CTCModel(Model):
         self._blank_idx = self.vocab.get_token_index(DEFAULT_PADDING_TOKEN)
         self._loss_type = loss_type
         if self._loss_type == "ctc":
-            self._loss = CTCLoss(blank=self._blank_idx, zero_infinity=True)
+            self._loss = CTCLoss(blank=self._blank_idx, zero_infinity=False)
         elif self._loss_type == "warp_ctc":
             from warpctc_pytorch import CTCLoss as WarpCTCLoss
             self._loss = WarpCTCLoss(
@@ -103,6 +104,15 @@ class CTCModel(Model):
         self._num_processes = beam_size
         self._wer = WordErrorRate()
 
+        sample_rate = 16000
+        self._sample_rate = sample_rate
+        win_length = int(sample_rate * 0.025)
+        hop_length = int(sample_rate * 0.01)
+        n_fft = win_length
+        self._mel_spectrogram = MelSpectrogram(sample_rate, n_fft,
+                                               win_length=win_length,
+                                               hop_length=hop_length,
+                                               n_mels=80)
         initializer(self)
 
     @overrides
@@ -143,6 +153,7 @@ class CTCModel(Model):
             A scalar loss to be optimised.
 
         """
+        #source_features = self._mel_spectrogram(source_features)
         target_mask = get_text_field_mask(target_tokens)
         epoch_num = epoch_num[0]
         output_layer_num = self.get_output_layer_num(epoch_num)

@@ -74,12 +74,17 @@ class Seq2SeqDatasetReader(DatasetReader):
 
     @overrides
     def _read(self, file_path: str):
+        counter = 0
         path = Path(file_path)
         file_prefix = str(path.parent.joinpath(path.stem))
         with open(".".join([file_prefix, self._source_affix]), "r") as source_file:
             with open(".".join([file_prefix, self._target_affix]), "r") as target_file:
                 for source_sequence, target_sequence in zip(source_file, target_file):
+                    if counter > 10000:
+                        break
                     yield self.text_to_instance(source_sequence, target_sequence)
+                    counter += 1
+                    del source_sequence, target_sequence
 
     @overrides
     def text_to_instance(self, source_string: str, target_string: str = None) -> Instance:  # type: ignore

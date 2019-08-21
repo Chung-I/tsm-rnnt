@@ -1,3 +1,4 @@
+import time
 from overrides import overrides
 
 import torch
@@ -7,7 +8,6 @@ import torch.nn.functional as F
 from allennlp.nn.util import replace_masked_values
 from allennlp.modules.attention import Attention
 from allennlp.common.registrable import Registrable
-import time
 
 
 def cuda_benchmark(func, *args, **kwargs):
@@ -62,8 +62,10 @@ def moving_max(x, w):
     x = F.max_pool1d(x, kernel_size=w, stride=1).squeeze(1)
     return x
 
+
 def fliped_cumsum(tensor, dim=-1):
     return torch.flip(torch.cumsum(torch.flip(tensor, dims=[dim]), dim=dim), dims=[dim])
+
 
 def frame(tensor, chunk_size, pad_end=False, value=0):
     if pad_end:
@@ -284,7 +286,8 @@ class MonotonicAttention(Attention, Registrable):
         if mode not in ["soft", "recursive", "hard"]:
             raise ValueError("Invalid forward mode {} for attention; \
                 accept only soft and hard mode".format(mode))
-        att_func = {"soft": self.soft, "recursive": self.recursive, "hard": self.hard}
+        att_func = {"soft": self.soft,
+                    "recursive": self.recursive, "hard": self.hard}
         return att_func[mode](encoder_outputs, decoder_h, previous_attention)
 
 
@@ -450,7 +453,8 @@ class MoChA(MonotonicAttention):
             return alpha, beta
 
         elif mode == "hard":
-            monotonic_attention = super()(encoder_outputs, decoder_h, previous_attention, mode="hard")
+            monotonic_attention = super()(encoder_outputs, decoder_h,
+                                          previous_attention, mode="hard")
             chunk_energy = self.chunk_energy(encoder_outputs, decoder_h)
             masked_energy = self.hard(
                 monotonic_attention, chunk_energy)
@@ -489,7 +493,8 @@ class MILk(MonotonicAttention):
             return alpha, beta
 
         elif mode == "hard":
-            monotonic_attention = super()(encoder_outputs, decoder_h, previous_attention, mode="hard")
+            monotonic_attention = super()(encoder_outputs, decoder_h,
+                                          previous_attention, mode="hard")
             chunk_energy = self.chunk_energy(encoder_outputs, decoder_h)
             masked_energy = self.hard(
                 monotonic_attention, chunk_energy)
@@ -498,7 +503,6 @@ class MILk(MonotonicAttention):
                 chunkwise_attention != chunkwise_attention,
                 0)  # a trick to replace nan value with 0
             return monotonic_attention, chunkwise_attention
-
 
     def soft(self, emit_probs, chunk_energy):
         """
@@ -510,7 +514,7 @@ class MILk(MonotonicAttention):
         cumulative_energy = torch.cumsum(chunk_energy, dim=-1)
         return chunk_energy * fliped_cumsum(
             emit_probs / cumulative_energy, dim=-1)
-    
+
     def hard(self, monotonic_attention, chunk_energy):
         """
         Mask non-attended area with '-inf'

@@ -123,5 +123,5 @@ dmypy.json
 # Pyre type checker
 .pyre/
 runs
-data
+/data
 path-train.sh
