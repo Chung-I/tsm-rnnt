@@ -4,7 +4,7 @@ import torch
 
 from allennlp.common import Params
 
-from stt.models.attention import soft_efficient, MoChA, MILk
+from stt.modules.attention import soft_efficient, MoChA, MILk
 from allennlp.common.testing import AllenNlpTestCase
 
 

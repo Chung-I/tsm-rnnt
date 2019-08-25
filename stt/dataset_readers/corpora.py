@@ -7,6 +7,7 @@ import multiprocessing as mp
 from collections import deque
 import psutil
 import tqdm
+import numpy as np
 
 
 def get_bar(*args, **kwargs):
@@ -71,6 +72,7 @@ def tailo2phone_factory():
 def pkl(root):
 
     #root_dir = Path("/home/nlpmaster/ssd-1t/corpus/TaiBible/PKL")
+    seed = RANDOM_SEEDS[root]
     root_dir = Path(root)
     tailo2phone = tailo2phone_factory()
     # new_dir.mkdir(exist_ok=True)
@@ -80,11 +82,18 @@ def pkl(root):
     with open(utts_file) as fp:
         utts = json.load(fp)
     utt_dict = {utt["mp3"]: utt["tailo"] for utt in utts}
+    pairs = []
     for chap in root_dir.iterdir():
         for wavfile in chap.glob("*.mp3"):
             tailo = utt_dict[str(wavfile.relative_to(root_dir))]
             text = tailo2phone(tailo)
-            yield str(wavfile), text
+            pairs.append((str(wavfile), text))
+            #yield str(wavfile), text
+    np.random.seed(seed)
+    RANDOM_SEEDS[root] += 1
+    randomized_orders = np.random.shuffle(np.arange(len(pairs)))
+    for idx in randomized_orders:
+        yield pairs[idx]
 
     # for utt in utts:
     #    text = tailo2phone(utt["tailo"])
@@ -102,3 +111,5 @@ CORPORA = {
     "/home/nlpmaster/ssd-1t/corpus/TaiBible/train_noise_augmented": pkl,
     "/home/nlpmaster/ssd-1t/corpus/TaiBible/dev_noise_augmented": pkl
 }
+
+RANDOM_SEEDS = {corpus: 0 for corpus in CORPORA.keys()}

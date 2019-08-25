@@ -322,7 +322,7 @@ class MoChA(MonotonicAttention):
 
         chunk_probs = F.softmax(framed_chunk_energy, dim=-1)
 
-        non_inf_mask = 1 - (framed_chunk_energy == float("-inf"))
+        non_inf_mask = ~(framed_chunk_energy == float("-inf"))
         chunk_probs = torch.where(
             non_inf_mask, chunk_probs, non_inf_mask.float())
 

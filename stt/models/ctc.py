@@ -19,6 +19,7 @@ from allennlp.nn import InitializerApplicator, RegularizerApplicator
 from allennlp.nn.util import get_text_field_mask, sequence_cross_entropy_with_logits, \
     get_lengths_from_binary_sequence_mask, get_mask_from_sequence_lengths
 from allennlp.training.metrics import BLEU
+from stt.models.cnn import VGGExtractor
 from ds_ctcdecoder import ctc_beam_search_decoder_batch
 
 from stt.data.text import Alphabet
@@ -109,10 +110,6 @@ class CTCModel(Model):
         win_length = int(sample_rate * 0.025)
         hop_length = int(sample_rate * 0.01)
         n_fft = win_length
-        self._mel_spectrogram = MelSpectrogram(sample_rate, n_fft,
-                                               win_length=win_length,
-                                               hop_length=hop_length,
-                                               n_mels=80)
         initializer(self)
 
     @overrides
