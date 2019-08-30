@@ -32,6 +32,7 @@ from stt.modules.losses import OCDLoss, maybe_sample_from_candidates
 from stt.modules.losses import target_to_candidates
 from stt.models.util import averaging_tensor_of_same_label, remove_sentence_boundaries
 from stt.modules.attention import MonotonicAttention, differentiable_average_lagging
+from stt.modules.stateful_attention import StatefulAttention
 
 @Model.register("phn_mocha")
 class PhnMoChA(Model):
@@ -551,7 +552,11 @@ class PhnMoChA(Model):
         with a beam size of 1 gives the same results.
         """
         # shape: (batch_size, max_input_sequence_length)
+        encoder_outputs = state["encoder_outputs"]
         source_mask = state["source_mask"]
+
+        if isinstance(self._attention, StatefulAttention):
+            self._attention.init_state(encoder_outputs, source_mask)
 
         batch_size = source_mask.size()[0]
 
@@ -650,6 +655,9 @@ class PhnMoChA(Model):
             if self._latency_penalty > 0.0:
                 DAL = differentiable_average_lagging(attns, source_mask, target_mask[:, 1:])
                 output_dict["dal"] = DAL
+
+        if isinstance(self._attention, StatefulAttention):
+            self._attention.reset_state()
 
         return output_dict
 
@@ -756,6 +764,8 @@ class PhnMoChA(Model):
             attended_output = util.weighted_sum(
                 encoder_outputs, chunk_attention)
             attention = monotonic_attention
+        elif isinstance(self._attention, StatefulAttention):
+            attended_output, attention = self._attention(decoder_hidden_state)
         else:
             attention = self._attention(
                 decoder_hidden_state, encoder_outputs, encoder_outputs_mask)
