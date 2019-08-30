@@ -1,7 +1,9 @@
+from typing import Tuple
+
 import torch
 import torch.nn.functional as F
 import numpy as np
-import pdb
+
 
 def is_nan_or_inf(x): return (x == np.inf) | (x != x)
 
@@ -38,3 +40,19 @@ def averaging_tensor_of_same_label(enc_outs: torch.Tensor,
 
     phn_enc_outs.masked_fill(is_nan_or_inf(phn_enc_outs), value=0)
     return phn_enc_outs, segment_lengths
+
+def remove_sentence_boundaries(tensor: torch.Tensor,
+                               mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    sequence_lengths = mask.sum(dim=1).detach().cpu().numpy()
+    tensor_shape = list(tensor.data.shape)
+    new_shape = list(tensor_shape)
+    new_shape[1] = tensor_shape[1] - 2
+    tensor_without_boundary_tokens = tensor.new_zeros(*new_shape)
+    new_mask = tensor.new_zeros((new_shape[0], new_shape[1]), dtype=torch.bool)
+    for i, j in enumerate(sequence_lengths):
+        if j > 2:
+            tensor_without_boundary_tokens[i, :(j - 2)] = tensor[i, 1:(j - 1)]
+            new_mask[i, :(j - 2)] = 1
+
+    return tensor_without_boundary_tokens, new_mask

@@ -1,16 +1,13 @@
-import csv
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Any
 import logging
-import random
-import numpy as np
 import os
-from opencc import OpenCC
-from overrides import overrides
 import re
 
+import numpy as np
+from opencc import OpenCC
+from overrides import overrides
+from conllu import parse_incr
 
-import kaldi_io
-from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import START_SYMBOL, END_SYMBOL
 from allennlp.data.dataset_readers.dataset_reader import DatasetReader
 from allennlp.data.fields import TextField, ArrayField, MetadataField, LabelField
@@ -18,10 +15,29 @@ from allennlp.data.instance import Instance
 from allennlp.data.tokenizers import Tokenizer, WordTokenizer, Token
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
 
-from stt.dataset_readers.utils import pad_and_stack, process_phone, word_to_phones
+from stt.dataset_readers.utils import pad_and_stack, word_to_phones
+
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
+
+def read_dependencies(file_path: str, use_language_specific_pos=False):
+
+    annotations = []
+    with open(os.path.join(file_path, "dep.txt"), "r") as conllu_file:
+        for annotation in parse_incr(conllu_file):
+            annotation = [x for x in annotation if isinstance(x["id"], int)]
+
+            heads = [x["head"] for x in annotation]
+            tags = [x["deprel"] for x in annotation]
+            words = [x["form"] for x in annotation]
+            if use_language_specific_pos:
+                pos_tags = [x["xpostag"] for x in annotation]
+            else:
+                pos_tags = [x["upostag"] for x in annotation]
+            annotations.append([heads, tags, words, pos_tags])
+
+    return annotations
 
 @DatasetReader.register("mao-stt")
 class SpeechToTextDatasetReader(DatasetReader):
@@ -56,6 +72,7 @@ class SpeechToTextDatasetReader(DatasetReader):
                  shard_size: int,
                  lexicon_path: str = None,
                  is_phone: bool = False,
+                 to_char: bool = False,
                  input_stack_rate: int = 1,
                  model_stack_rate: int = 1,
                  max_frames: int = 3000,
@@ -65,6 +82,7 @@ class SpeechToTextDatasetReader(DatasetReader):
                  delimiter: str = "\t",
                  curriculum: List[Tuple[int, int]] = None,
                  mmap: bool = True,
+                 dep: bool = False,
                  bucket: bool = False,
                  lazy: bool = False) -> None:
         super().__init__(lazy)
@@ -83,6 +101,7 @@ class SpeechToTextDatasetReader(DatasetReader):
         self._curriculum = curriculum
         self._epoch_num = 0
         self._mmap = mmap
+        self._dep = dep
 
         self.lexicon: Dict[str, str] = {}
         if lexicon_path is not None:
@@ -94,6 +113,7 @@ class SpeechToTextDatasetReader(DatasetReader):
         self.cc = OpenCC('s2t')
         self.w2p = word_to_phones(self.lexicon)
         self._is_phone = is_phone
+        self._to_char = to_char
 
     @overrides
     def _read(self, file_path: str) -> Iterable[Instance]:
@@ -112,6 +132,10 @@ class SpeechToTextDatasetReader(DatasetReader):
         with open(os.path.join(file_path, "trn.txt")) as f:
             target_datas = f.read().splitlines()
 
+        annotations = []
+        if self._dep:
+            annotations = read_dependencies(file_path)
+
         max_src_len = self.get_max_src_len()
         curriculum = max_src_len < np.inf
 
@@ -123,15 +147,19 @@ class SpeechToTextDatasetReader(DatasetReader):
         batched_indices = list(range(0, len(source_orders), self._shard_size))
         np.random.shuffle(batched_indices)
 
+        annotation = None
+
         for start_idx in batched_indices:
             end_idx = min(start_idx + self._shard_size, len(source_orders))
             for idx in range(start_idx, end_idx):
+                if annotations:
+                    annotation = annotations[idx]
                 if self._bucket or curriculum:
                     idx = source_orders[idx]
                 start, end = source_positions[idx], source_positions[idx+1]
                 src = source_datas[start:end]
                 tgt = target_datas[idx]
-                instance = self.text_to_instance(src, tgt)
+                instance = self.text_to_instance(src, tgt, annotation)
                 tgt_len = instance.fields['target_tokens'].sequence_length()
                 if tgt_len < 1 or src.shape[0] > self._max_frames \
                         or (src.shape[0]//self.stack_rate) < tgt_len:
@@ -149,7 +177,8 @@ class SpeechToTextDatasetReader(DatasetReader):
     @overrides
     def text_to_instance(self,
                          source_array: np.ndarray,
-                         target_string: str = None) -> Instance:  # type: ignore
+                         target_string: str = None,
+                         annotation: List[Any] = None) -> Instance:  # type: ignore
         # pylint: disable=arguments-differ
         source_array, src_len = pad_and_stack(source_array,
                                               self.input_stack_rate,
@@ -159,29 +188,38 @@ class SpeechToTextDatasetReader(DatasetReader):
         source_field = ArrayField(source_array)
 
         if target_string is not None:
-            if not self.lexicon:
-                target = self._target_tokenizer.tokenize(target_string)
-                if self._target_add_start_end_token:
-                    target.insert(0, Token(START_SYMBOL))
-                    target.append(Token(END_SYMBOL))
-            else:
-                phonemized_target: List[str] = []
-                tokenized_target = [word.text for word in
-                                    self._target_tokenizer.tokenize(target_string)]
+            char_target = [Token(x) for x in list(re.sub(r"\s+", "", target_string))]
+            target = self._target_tokenizer.tokenize(target_string)
+
+            if self.lexicon:
+                phn_target: List[str] = []
+                tokenized_target = [word.text for word in target]
                 for word in tokenized_target:
                     word = self.cc.convert(word)
-                    phonemized_target.extend(self.w2p(word))
+                    phn_target.extend(self.w2p(word))
 
-                if self._target_add_start_end_token:
-                    phonemized_target.insert(0, START_SYMBOL)
-                    phonemized_target.append(END_SYMBOL)
-                target = [Token(x) for x in phonemized_target]
+                # if self._target_add_start_end_token:
+                #     phn_target.insert(0, START_SYMBOL)
+                #     phn_target.append(END_SYMBOL)
+                phn_target_field = TextField([Token(x) for x in phn_target], {
+                    "tokens": SingleIdTokenIndexer()})
+
+            if self._target_add_start_end_token:
+                target.insert(0, Token(START_SYMBOL))
+                target.append(Token(END_SYMBOL))
 
             target_field = TextField(
                 target, self._target_token_indexers)
+            char_target_field = TextField(char_target, {
+                "tokens": SingleIdTokenIndexer()})
+            print(target, char_target, phn_target)
             return Instance({"source_features": source_field,
                              "target_tokens": target_field,
+                             #"target_phn_tokens": phn_target_field,
+                             #"target_char_tokens": char_target_field,
+                             "transcripts": MetadataField(target_string),
                              "source_lengths": source_length_field})
+
         else:
             return Instance({"source_features": source_field,
                              "source_lengths": source_length_field})

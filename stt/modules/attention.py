@@ -5,10 +5,48 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from allennlp.nn.util import replace_masked_values
+from allennlp.nn.util import replace_masked_values, get_lengths_from_binary_sequence_mask
 from allennlp.modules.attention import Attention
 from allennlp.common.registrable import Registrable
 
+from stt.models.util import masked_mean
+
+
+def differentiable_average_lagging(mono_attns: torch.FloatTensor,
+                                   source_mask: torch.BoolTensor,
+                                   target_mask: torch.BoolTensor) -> torch.Tensor:
+    """
+    Parameters
+    ----------
+    mono_attns : ``torch.FloatTensor``, required.
+        A tensor of shape ``(batch_size, num_decoding_steps, num_encoding_steps)``.
+    mask : ``torch.BoolTensor``, required.
+        A tensor of shape ``(batch_size, num_encoding_steps)``.
+    """
+    # shape (batch_size, num_encoding_steps)
+    import pdb
+    pdb.set_trace()
+    step_values = source_mask * torch.cumsum(source_mask, dim=-1)
+    source_lengths = get_lengths_from_binary_sequence_mask(source_mask)
+    target_lengths = get_lengths_from_binary_sequence_mask(target_mask)
+    ratio = target_lengths / source_lengths
+
+    # shape (batch_size, num_decoding_steps)
+    expected_step_delays = torch.sum(step_values.unsqueeze(1) * mono_attns, dim=-1)
+    minimum_step_delays = expected_step_delays.clone()
+    _, num_decoding_steps, _ = mono_attns.size()
+    for step in range(1, num_decoding_steps):
+        minimum_step_delays[:, step] = torch.max(minimum_step_delays[:, step] + 1 / ratio,
+                                                 expected_step_delays[:, step])
+
+    # shape (batch_size, num_decoding_steps)    
+    DAL = minimum_step_delays - torch.arange(num_decoding_steps).unsqueeze(0) / ratio
+
+    # shape (batch_size,)
+    DAL = masked_mean(DAL, mask=target_mask, dim=-1)
+    DAL = torch.mean(DAL)
+
+    return DAL
 
 def cuda_benchmark(func, *args, **kwargs):
     torch.cuda.synchronize()
@@ -91,8 +129,7 @@ class Energy(nn.Module):
                  enc_dim: int,
                  dec_dim: int,
                  att_dim: int,
-                 mode: str = "bahdanau",
-                 init_r: float = -0.1) -> None:
+                 init_r: float = -4) -> None:
         """
         [Modified Bahdahnau attention] from
         "Online and Linear-Time Attention by Enforcing Monotonic Alignment" (ICML 2017)
@@ -138,7 +175,8 @@ class MonotonicAttention(Attention, Registrable):
                  enc_dim: int,
                  dec_dim: int,
                  att_dim: int,
-                 dirac_at_first_step: bool = True):
+                 dirac_at_first_step: bool = False,
+                 discreteness: float = 4.0):
         """
         [Monotonic Attention] from
         "Online and Linear-Time Attention by Enforcing Monotonic Alignment" (ICML 2017)
@@ -147,11 +185,12 @@ class MonotonicAttention(Attention, Registrable):
         super().__init__()
 
         self._dirac_at_first_step = dirac_at_first_step
+        self._discreteness = discreteness
         self.monotonic_energy = Energy(enc_dim, dec_dim, att_dim)
 
     def gaussian_noise(self, tensor):
         """Additive gaussian nosie to encourage discreteness"""
-        return tensor.new_empty(tensor.size()).normal_()
+        return tensor.new_empty(tensor.size()).normal_(std=self._discreteness)
 
     def soft_recursive(self, encoder_outputs, decoder_h, previous_alpha=None):
         """
@@ -298,13 +337,14 @@ class MoChA(MonotonicAttention):
                  enc_dim: int,
                  dec_dim: int,
                  att_dim: int,
-                 dirac_at_first_step: bool = False) -> None:
+                 dirac_at_first_step: bool = False,
+                 discreteness: float = 4.0) -> None:
         """
         [Monotonic Chunkwise Attention] from
         "Monotonic Chunkwise Attention" (ICLR 2018)
         https://openreview.net/forum?id=Hko85plCW
         """
-        super().__init__(enc_dim, dec_dim, att_dim, dirac_at_first_step)
+        super().__init__(enc_dim, dec_dim, att_dim, dirac_at_first_step, discreteness)
         self.chunk_size = chunk_size
         self.chunk_energy = Energy(enc_dim, dec_dim, att_dim)
         self.unfold = nn.Unfold(kernel_size=(self.chunk_size, 1))
@@ -470,13 +510,15 @@ class MILk(MonotonicAttention):
     def __init__(self,
                  enc_dim: int,
                  dec_dim: int,
-                 att_dim: int) -> None:
+                 att_dim: int,
+                 dirac_at_first_step: bool = False,
+                 discreteness: float = 4.0) -> None:
         """
         [Monotonic Chunkwise Attention] from
         "Monotonic Chunkwise Attention" (ICLR 2018)
         https://openreview.net/forum?id=Hko85plCW
         """
-        super().__init__(enc_dim, dec_dim, att_dim)
+        super().__init__(enc_dim, dec_dim, att_dim, dirac_at_first_step, discreteness)
         self.chunk_energy = Energy(enc_dim, dec_dim, att_dim)
         self.softmax = nn.Softmax(dim=1)
 
