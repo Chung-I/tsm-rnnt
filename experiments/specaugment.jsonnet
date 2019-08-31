@@ -1,25 +1,26 @@
-local BATCH_SIZE = 32;
+local BATCH_SIZE = 24;
 local FRAME_RATE = 1;
-local ENCODER_HIDDEN_SIZE = 256;
-local DECODER_HIDDEN_SIZE = 256;
+local ENCODER_HIDDEN_SIZE = 1280;
+local DECODER_HIDDEN_SIZE = 1280;
 local VOCAB_PATH = "data/vocabulary/phn_level";
 local NUM_GPUS = 1;
 local TARGET_NAMESPACE = "target_tokens";
 local PHN_TARGET_NAMESPACE = "phn_target_tokens";
 local NUM_THREADS = 4;
 local VGG = true;
-local OUT_CHANNEL = 32;
+local OUT_CHANNEL = 128;
 local STACK_RATE = if VGG then 4 else 1;
-local ENCODER_OUTPUT_SIZE = 80 * (if VGG then (OUT_CHANNEL / STACK_RATE) else 1) * FRAME_RATE;
+local VGG_OUTPUT_SIZE = 80 * (if VGG then (OUT_CHANNEL / STACK_RATE) else 1) * FRAME_RATE;
+local DIRECTIONS = 2;
 
 
 local BASE_ITERATOR = {
   "type": "homogeneous_batch",
   "max_instances_in_memory": 128 * NUM_GPUS,
   "batch_size": BATCH_SIZE,
-  // "sorting_keys": [["source_features", "dimension_0"],
-  //                   #[TARGET_NAMESPACE, "num_tokens"]],
-  //                  [PHN_TARGET_NAMESPACE, "num_tokens"]],
+//   "sorting_keys": [["source_features", "dimension_0"],
+//                    [TARGET_NAMESPACE, "num_tokens"]],
+//                    [PHN_TARGET_NAMESPACE, "num_tokens"],
 //   "maximum_samples_per_batch": ["dimension_0", 6400],
   "track_epoch": true
 };
@@ -28,6 +29,7 @@ local TSM_READER = {
   "type": "mao-stt",
   "lazy": true,
   "mmap": true,
+  "lexicon_path": "/home/nlpmaster/lexicon.txt",
   "shard_size": BATCH_SIZE,
   "input_stack_rate": FRAME_RATE,
   "model_stack_rate": STACK_RATE,
@@ -80,14 +82,14 @@ local PTS_READER = {
   "dataset_reader": {
       "type": "interleaving",
       "readers": {
-          [PHN_TARGET_NAMESPACE]: PTS_READER
+          [TARGET_NAMESPACE]: TSM_READER
       },
       "lazy": true
   },
   "validation_dataset_reader": {
       "type": "interleaving",
       "readers": {
-          [PHN_TARGET_NAMESPACE]: PTS_READER
+          [TARGET_NAMESPACE]: TSM_READER
       },
       "lazy": true
   },
@@ -96,12 +98,12 @@ local PTS_READER = {
   },
   "train_data_path": |||
     {
-        "phn_target_tokens": "/home/nlpmaster/ssd-1t/corpus/PTS-MSub-Vol1/segmented/train"
+        "target_tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/train_outs"
     }
   |||,
   "validation_data_path": |||
     {
-        "phn_target_tokens": "/home/nlpmaster/ssd-1t/corpus/PTS-MSub-Vol1/segmented/dev"
+        "target_tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/valid_outs"
     }
   |||,
   "model": {
@@ -110,24 +112,37 @@ local PTS_READER = {
     "cmvn": true,
     "from_candidates": false,
     "sampling_strategy": "max",
+    "joint_ctc_ratio": 0.2,
+    "time_mask_width": 70,
+    "freq_mask_width": 15,
+    "time_mask_max_ratio": 0.2,
     // "encoder": {
     //   "type": "awd-rnn",
     //   "input_size": 80 * FRAME_RATE,
     //   "hidden_size": ENCODER_HIDDEN_SIZE,
-    //   "num_layers": 5,
+    //   "num_layers": 2,
     //   "dropout": 0.5,
     //   "dropouth": 0.5,
     //   "dropouti": 0.5,
     //   "wdrop": 0.0,
-    //   "stack_rates": [1, 1, 1, 1, 1],
+    //   "stack_rates": [2, 2],
+    // },
+    // "encoder": {
+    //   "type": "lstm",
+    //   "input_size": 80 * FRAME_RATE,
+    //   "hidden_size": ENCODER_HIDDEN_SIZE,
+    //   "num_layers": 6,
+    //   "bidirectional": (DIRECTIONS == 2)
     // },
     "encoder": {
-      "type": "lstm",
-      "input_size": 80 * FRAME_RATE,
+      "type": "residual_bidirectional_lstm",
+      "input_size": VGG_OUTPUT_SIZE,
       "hidden_size": ENCODER_HIDDEN_SIZE,
-      "num_layers": 5
+      "num_layers": 6,
+      "layer_dropout_probability": 0.0,
+      "use_residual": true
     },
-    "dropout": 0.5,
+    "dec_layers": 2,
     "has_vgg": VGG,
     "vgg_out_channel": OUT_CHANNEL,
     "max_decoding_steps": 30,
@@ -142,11 +157,14 @@ local PTS_READER = {
     //   #"dirac_at_first_step": false
     // },
     "attention": {
-      "type": "bilinear",
+      "type": "stateful",
       "vector_dim": DECODER_HIDDEN_SIZE,
-      "matrix_dim": ENCODER_HIDDEN_SIZE
+      "matrix_dim": ENCODER_HIDDEN_SIZE * DIRECTIONS,
+      "attention_dim": 512,
+      "values_dim": 512,
+      "num_heads" : 1
     },
-    "n_pretrain_ctc_epochs": 2,
+    "n_pretrain_ctc_epochs": 0,
     "target_namespace": TARGET_NAMESPACE,
     "phoneme_target_namespace": PHN_TARGET_NAMESPACE,
     "initializer": [
@@ -177,9 +195,9 @@ local PTS_READER = {
   "trainer": {
     "num_epochs": 300,
     "patience": 20,
-    "grad_norm": 5.0,
+    "grad_clipping": 3.0,
     "cuda_device": 0,
-    "validation_metric": "-PHN_WER",
+    "validation_metric": "+BLEU",
     "num_serialized_models_to_keep": 1,
     "should_log_learning_rate": true,
     // "learning_rate_scheduler": {
@@ -195,7 +213,7 @@ local PTS_READER = {
     // },
     "learning_rate_scheduler": {
       "type": "multi_step",
-      "milestones": [48, 60, 72],
+      "milestones": [60, 72, 84],
       "gamma": 0.5,
     },
     "optimizer": {

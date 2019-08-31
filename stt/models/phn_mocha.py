@@ -33,6 +33,7 @@ from stt.modules.losses import target_to_candidates
 from stt.models.util import averaging_tensor_of_same_label, remove_sentence_boundaries
 from stt.modules.attention import MonotonicAttention, differentiable_average_lagging
 from stt.modules.stateful_attention import StatefulAttention
+from stt.modules.specaugment import TimeMask, FreqMask
 
 @Model.register("phn_mocha")
 class PhnMoChA(Model):
@@ -90,6 +91,10 @@ class PhnMoChA(Model):
                  target_embedding_dim: int,
                  max_decoding_steps: int,
                  cmvn: bool = True,
+                 time_mask_width: int = 0,
+                 freq_mask_width: int = 0,
+                 time_mask_max_ratio: float = 0.0,
+                 dec_layers: int = 1,
                  layerwise_pretraining: List[Tuple[int, int]] = None,
                  pretrained_model_path: str = None,
                  in_channel: int = 1,
@@ -182,9 +187,10 @@ class PhnMoChA(Model):
         self._encoder_output_dim = self._encoder.get_output_dim()
         #self._decoder_output_dim = self._encoder_output_dim
         self._decoder_output_dim = target_embedding_dim
+        self._dec_layers = dec_layers
         if self._decoder_output_dim != self._encoder_output_dim:
             self.bridge = nn.Linear(
-                self._encoder_output_dim, self._decoder_output_dim, bias=False)
+                self._encoder_output_dim, self._dec_layers * self._decoder_output_dim, bias=False)
 
         if self._attention:
             # If using attention, a weighted average over encoder outputs will be concatenated
@@ -200,8 +206,8 @@ class PhnMoChA(Model):
         # We'll use an LSTM cell as the recurrent cell that produces a hidden state
         # for the decoder at each time step.
         # TODO (pradeep): Do not hardcode decoder cell type.
-        self._decoder_cell = LSTMCell(
-            self._decoder_input_dim, self._decoder_output_dim)
+        self._decoder = nn.LSTM(self._decoder_input_dim, self._decoder_output_dim,
+                                num_layers=self._dec_layers)
 
         self._num_phn_classes = self.vocab.get_vocab_size(self._phn_target_namespace)
         self._ctc_projection_layer = nn.Linear(self._encoder_output_dim, self._num_phn_classes)
@@ -246,6 +252,9 @@ class PhnMoChA(Model):
 
         self._latency_penalty = latency_penalty
         self._cur_dataset = None
+
+        self.time_mask = TimeMask(time_mask_width, time_mask_max_ratio)
+        self.freq_mask = FreqMask(freq_mask_width)
 
         initializer(self)
         if pretrained_model_path is not None:
@@ -360,6 +369,8 @@ class PhnMoChA(Model):
         -------
         Dict[str, torch.Tensor]
         """
+        import pdb
+        pdb.set_trace()
         output_dict = {}
         self._cur_dataset = dataset[0]
 
@@ -372,6 +383,9 @@ class PhnMoChA(Model):
                 source_features.transpose(-2, -1)).transpose(-2, -1)
             source_mask = util.get_mask_from_sequence_lengths(source_lengths,
                                                               source_features.size(1)).bool()
+            source_features = self.time_mask(source_features, source_mask)
+            source_features = self.freq_mask(source_features, source_mask)
+            
         source_features = source_features.masked_fill(
             ~source_mask.unsqueeze(-1).expand_as(source_features), 0.0)
         state = self._encode(source_features, source_lengths)
@@ -533,15 +547,18 @@ class PhnMoChA(Model):
             encoder_outputs,
             source_mask,
             self._encoder.is_bidirectional())
-        if self._encoder_output_dim != self._decoder_output_dim:
+        if self._encoder_output_dim != self._dec_layers * self._decoder_output_dim:
             final_encoder_output = self.bridge(final_encoder_output)
+            initial_decoder_input = final_encoder_output.view(-1, self._dec_layers,
+                                                              self._decoder_output_dim) \
+                                                        .transpose(1, 0)
         # Initialize the decoder hidden state with the final output of the encoder.
         # shape: (batch_size, decoder_output_dim)
-        state["decoder_hidden"] = final_encoder_output
-        state["decoder_output"] = final_encoder_output
+        state["decoder_hidden"] = initial_decoder_input
+        state["decoder_output"] = initial_decoder_input[:, 0, :]
         # shape: (batch_size, decoder_output_dim)
         state["decoder_context"] = encoder_outputs.new_zeros(
-            batch_size, self._decoder_output_dim)
+            self._dec_layers, batch_size, self._decoder_output_dim)
         state["attention"] = None
         if isinstance(self._attention, StatefulAttention):
             state["att_keys"], state["att_values"] = \
@@ -709,21 +726,22 @@ class PhnMoChA(Model):
 
         # shape (decoder_hidden): (batch_size, decoder_output_dim)
         # shape (decoder_context): (batch_size, decoder_output_dim)
-        decoder_hidden, decoder_context = self._decoder_cell(
-            decoder_input,
+        outputs, (decoder_hidden, decoder_context) = self._decoder(
+            decoder_input.unsqueeze(0),
             (decoder_hidden, decoder_context))
 
+        outputs = outputs.squeeze(0)
         if self._attention:
             # shape: (group_size, encoder_output_dim)
-            attended_output, attention = self._prepare_attended_output(decoder_hidden, state)
+            attended_output, attention = self._prepare_attended_output(outputs, state)
 
             # shape: (group_size, decoder_output_dim)
             decoder_output = torch.tanh(
-                self.att_out(torch.cat((attended_output, decoder_hidden), -1))
+                self.att_out(torch.cat((attended_output, outputs), -1))
             )
         else:
             # shape: (group_size, target_embedding_dim)
-            decoder_output = decoder_hidden
+            decoder_output = outputs
 
         state["decoder_hidden"] = decoder_hidden
         state["decoder_context"] = decoder_context

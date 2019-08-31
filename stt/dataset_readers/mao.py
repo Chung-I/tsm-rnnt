@@ -158,6 +158,9 @@ class SpeechToTextDatasetReader(DatasetReader):
                 start, end = source_positions[idx], source_positions[idx+1]
                 src = source_datas[start:end]
                 tgt = target_datas[idx]
+                if start == end or not tgt.strip():
+                    dropped_instances += 1
+                    continue
                 instance = self.text_to_instance(src, tgt, annotation)
                 tgt_len = instance.fields['target_tokens'].sequence_length()
                 if tgt_len < 1 or src.shape[0] > self._max_frames \
