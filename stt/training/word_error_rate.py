@@ -66,9 +66,7 @@ class WordErrorRate(Metric):
         wer = self._total_errors / (self._total_words + 1e-8)
         if reset:
             self.reset()
-        return {
-            "WER": wer
-        }
+        return wer
 
     @overrides
     def reset(self):

@@ -4,6 +4,7 @@ import os
 import sys
 import torch
 torch.multiprocessing.set_sharing_strategy('file_system')
+torch.backends.cudnn.deterministic = True
 
 if os.environ.get("ALLENNLP_DEBUG"):
     LEVEL = logging.DEBUG

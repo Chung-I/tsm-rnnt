@@ -146,7 +146,6 @@ class SpeechToTextDatasetReader(DatasetReader):
 
         batched_indices = list(range(0, len(source_orders), self._shard_size))
         np.random.shuffle(batched_indices)
-
         annotation = None
 
         for start_idx in batched_indices:
@@ -212,7 +211,7 @@ class SpeechToTextDatasetReader(DatasetReader):
                 target, self._target_token_indexers)
             char_target_field = TextField(char_target, {
                 "tokens": SingleIdTokenIndexer()})
-            print(target, char_target, phn_target)
+            #print(target, char_target, phn_target)
             return Instance({"source_features": source_field,
                              "target_tokens": target_field,
                              #"target_phn_tokens": phn_target_field,

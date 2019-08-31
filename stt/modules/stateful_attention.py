@@ -42,7 +42,7 @@ class StatefulAttention(Attention):
                  num_heads: int = 1,
                  activation: Activation = None,
                  attention_dropout_prob: float = 0.0,
-                 normalize: bool = True) -> None:
+                 normalize=True) -> None:
         super().__init__(normalize)
 
         self._num_heads = num_heads
@@ -64,26 +64,18 @@ class StatefulAttention(Attention):
 
         self._activation = activation or Activation.by_name('linear')()
         self._num_heads = num_heads
-        self.reset_state()
         self.reset_parameters()
 
     def reset_parameters(self):
-        torch.nn.init.xavier_uniform_(self._weight_matrix)
-        self._bias.data.fill_(0)
+        torch.nn.init.xavier_uniform_(self._combined_projection.weight)
+        torch.nn.init.xavier_uniform_(self._query_projection.weight)
 
-    def init_state(self, matrix: torch.Tensor, mask: torch.Tensor) -> None:
+    def init_state(self, matrix: torch.Tensor) -> None:
         combined_projection = self._combined_projection(matrix)
         keys, *values = combined_projection.split(self._attention_dim, -1)
         keys = keys.contiguous()
         values = torch.cat(values, -1).contiguous()
-        self.keys = keys
-        self.values = values
-        self.mask = mask
-
-    def reset_state(self) -> None:
-        self.keys = None
-        self.values = None
-        self.mask = None
+        return keys, values
 
     def _view_as_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         batch_size, timesteps, hidden_dim = tensor.size()
@@ -96,30 +88,29 @@ class StatefulAttention(Attention):
 
     @overrides
     def forward(self, queries: torch.Tensor,
-                inputs: torch.Tensor = None,
-                mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        if inputs is not None:
-            self.init_state(inputs, mask)
+                keys: torch.Tensor,
+                values: torch.Tensor,
+                mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        batch_size, enc_timesteps, _ = self.keys.size()
+        batch_size, enc_timesteps, _ = keys.size()
 
         if len(queries.size()) < 3:
             queries = queries.unsqueeze(1)
         
-        dec_timesteps = self.queries.size(1)
+        dec_timesteps = queries.size(1)
 
         queries = self._query_projection(queries)
 
         if self._num_heads > 1:
-            keys_per_head = self._view_as_heads(self.keys)
-            values_per_head = self._view_as_heads(self.values)
+            keys_per_head = self._view_as_heads(keys)
+            values_per_head = self._view_as_heads(values)
 
-            queries_per_head = self._view_as_heads(queries.unsqueeze(1)).squeeze(1)
+            queries_per_head = self._view_as_heads(queries)
             scaled_similarities = torch.bmm(queries_per_head / self._scale,
                                             keys_per_head.transpose(1, 2))
 
             attention = masked_softmax(scaled_similarities,
-                                       self.mask.repeat(1, self._num_heads) \
+                                       mask.repeat(1, self._num_heads) \
                                         .view(batch_size * self._num_heads, enc_timesteps),
                                        memory_efficient=True)
 
@@ -130,18 +121,20 @@ class StatefulAttention(Attention):
                                    int(self._values_dim / self._num_heads))
             outputs = outputs.transpose(1, 2).contiguous()
             outputs = outputs.view(batch_size, dec_timesteps, self._values_dim)
+            attention = attention.view(batch_size, self._num_heads, -1)
         else:
-            scaled_similarities = torch.bmm(queries / self.scale,
-                                            self.keys.transpose(1, 2))
+            scaled_similarities = torch.bmm(queries / self._scale,
+                                            keys.transpose(1, 2))
             attention = masked_softmax(scaled_similarities,
-                                       self.mask,
+                                       mask,
                                        memory_efficient=True)
 
             attention = self._attention_dropout(attention)
-            outputs = weighted_sum(self.values, attention)
+            outputs = weighted_sum(values, attention)
 
         outputs = self._output_projection(outputs)
         if dec_timesteps == 1:
             outputs = outputs.squeeze(1)
+            attention = attention.squeeze(1)
 
         return outputs, attention

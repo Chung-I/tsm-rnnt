@@ -144,7 +144,7 @@ class PhnMoChA(Model):
             "phn_ctc_loss": Average(),
             "joint_ctc_loss": Average(),
             "att_loss": Average(),
-            "dal_loss": (None if latency_penalty > 0.0 else Average())
+            "dal_loss": (Average() if latency_penalty > 0.0 else None)
         }
 
         # At prediction time, we use a beam search to find the most likely sequence of target tokens.
@@ -383,6 +383,10 @@ class PhnMoChA(Model):
                                                  self._ctc_proj_drop,
                                                  self._num_phn_classes,
                                                  state)
+            if not self._train_at_phn_level:
+                predictions = self._ctc_greedy_decode(ctc_log_probs, self._phn_pad_index)
+                self._phn_wer(predictions, target_tokens["tokens"])
+
         if self._joint_ctc_ratio > 0.0:
             joint_ctc_log_probs = self._get_ctc_output(self._joint_ctc_projection_layer,
                                                        self._joint_ctc_proj_drop,
@@ -410,7 +414,7 @@ class PhnMoChA(Model):
                     ctc_log_probs)
 
             state = self._init_decoder_state(state)
-            output_dict = self._forward_loop(state, target_tokens)
+            output_dict.update(self._forward_loop(state, target_tokens))
             self._wer(output_dict["predictions"], target_tokens["tokens"])
 
 
@@ -523,9 +527,11 @@ class PhnMoChA(Model):
     def _init_decoder_state(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         batch_size = state["source_mask"].size(0)
         # shape: (batch_size, encoder_output_dim)
+        encoder_outputs = state["encoder_outputs"]
+        source_mask = state["source_mask"]
         final_encoder_output = util.get_final_encoder_states(
-            state["encoder_outputs"],
-            state["source_mask"],
+            encoder_outputs,
+            source_mask,
             self._encoder.is_bidirectional())
         if self._encoder_output_dim != self._decoder_output_dim:
             final_encoder_output = self.bridge(final_encoder_output)
@@ -534,9 +540,12 @@ class PhnMoChA(Model):
         state["decoder_hidden"] = final_encoder_output
         state["decoder_output"] = final_encoder_output
         # shape: (batch_size, decoder_output_dim)
-        state["decoder_context"] = state["encoder_outputs"].new_zeros(
+        state["decoder_context"] = encoder_outputs.new_zeros(
             batch_size, self._decoder_output_dim)
         state["attention"] = None
+        if isinstance(self._attention, StatefulAttention):
+            state["att_keys"], state["att_values"] = \
+                self._attention.init_state(encoder_outputs)
 
         return state
 
@@ -552,11 +561,7 @@ class PhnMoChA(Model):
         with a beam size of 1 gives the same results.
         """
         # shape: (batch_size, max_input_sequence_length)
-        encoder_outputs = state["encoder_outputs"]
         source_mask = state["source_mask"]
-
-        if isinstance(self._attention, StatefulAttention):
-            self._attention.init_state(encoder_outputs, source_mask)
 
         batch_size = source_mask.size()[0]
 
@@ -656,9 +661,6 @@ class PhnMoChA(Model):
                 DAL = differentiable_average_lagging(attns, source_mask, target_mask[:, 1:])
                 output_dict["dal"] = DAL
 
-        if isinstance(self._attention, StatefulAttention):
-            self._attention.reset_state()
-
         return output_dict
 
     def _forward_beam_search(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -688,12 +690,6 @@ class PhnMoChA(Model):
 
         Inputs are the same as for `take_step()`.
         """
-        # shape: (group_size, max_input_sequence_length, encoder_output_dim)
-        encoder_outputs = state["encoder_outputs"]
-
-        # shape: (group_size, max_input_sequence_length)
-        source_mask = state["source_mask"]
-
         # shape: (group_size, decoder_output_dim)
         decoder_hidden = state["decoder_hidden"]
 
@@ -719,8 +715,7 @@ class PhnMoChA(Model):
 
         if self._attention:
             # shape: (group_size, encoder_output_dim)
-            attended_output, attention = self._prepare_attended_output(
-                decoder_hidden, encoder_outputs, source_mask, attention)
+            attended_output, attention = self._prepare_attended_output(decoder_hidden, state)
 
             # shape: (group_size, decoder_output_dim)
             decoder_output = torch.tanh(
@@ -741,23 +736,27 @@ class PhnMoChA(Model):
         return output_projections, state
 
     def _prepare_attended_output(self,
-                                 decoder_hidden_state: torch.LongTensor = None,
-                                 encoder_outputs: torch.LongTensor = None,
-                                 encoder_outputs_mask: torch.LongTensor = None,
-                                 prev_attention: torch.LongTensor = None) -> torch.Tensor:
+                                 decoder_hidden_state: torch.Tensor,
+                                 state: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Apply attention over encoder outputs and decoder state."""
         # Ensure mask is also a FloatTensor. Or else the multiplication within
         # attention will complain.
         # shape: (batch_size, max_input_sequence_length)
-        encoder_outputs_mask = encoder_outputs_mask.float()
-        encoder_outs: Dict[str, torch.Tensor] = {
-            "value": encoder_outputs,
-            "mask": encoder_outputs_mask
-        }
+
+        encoder_outputs = state["encoder_outputs"]
+        source_mask = state["source_mask"]
+        prev_attention = state["attention"]
+        att_keys = state["att_keys"]
+        att_values = state["att_values"]
 
         # shape: (batch_size, max_input_sequence_length)
         mode = "soft" if self.training else "hard"
         if isinstance(self._attention, MonotonicAttention):
+            encoder_outs: Dict[str, torch.Tensor] = {
+                "value": state["encoder_outputs"],
+                "mask": state["source_mask"]
+            }
+
             monotonic_attention, chunk_attention = self._attention(
                 encoder_outs, decoder_hidden_state, prev_attention, mode=mode)
             # shape: (batch_size, encoder_output_dim)
@@ -765,10 +764,11 @@ class PhnMoChA(Model):
                 encoder_outputs, chunk_attention)
             attention = monotonic_attention
         elif isinstance(self._attention, StatefulAttention):
-            attended_output, attention = self._attention(decoder_hidden_state)
+            attended_output, attention = self._attention(decoder_hidden_state,
+            att_keys, att_values, source_mask)
         else:
             attention = self._attention(
-                decoder_hidden_state, encoder_outputs, encoder_outputs_mask)
+                decoder_hidden_state, source_mask)
             attended_output = util.weighted_sum(
                 encoder_outputs, attention)
 
@@ -841,24 +841,30 @@ class PhnMoChA(Model):
         return output_dict
 
     def _update_metrics(self, output_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
-        for key, track_func in self._logs:
-            track_func(output_dict[key])
+        for key, track_func in self._logs.items():
+            try:
+                track_func(output_dict[key])
+            except KeyError:
+                continue
 
     @overrides
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
         all_metrics: Dict[str, float] = {}
 
         if "phn" in self._cur_dataset:
-            all_metrics["phn_ctc_loss"] = self._ctc_log.get_metric(reset=reset).item()
+            all_metrics["phn_ctc_loss"] = self._logs["phn_ctc_loss"].get_metric(reset=reset).item()
+            all_metrics["phn_wer"] = self._phn_wer.get_metric(reset=reset)
         if self._cur_dataset == self._target_namespace:
-            all_metrics["att_loss"] = self._att_log.get_metric(reset=reset).item()
-        if self._dal_log:
-            all_metrics["dal_loss"] = self._dal_log.get_metric(reset=reset).item()
+            all_metrics["att_loss"] = self._logs["att_loss"].get_metric(reset=reset).item()
+            all_metrics["att_wer"] = self._wer.get_metric(reset=reset)
+        if self._joint_ctc_ratio > 0.0:
+            all_metrics["joint_ctc_loss"] = self._logs["joint_ctc_loss"].get_metric(reset=reset).item()
+            all_metrics["ctc_wer"] = self._ctc_wer.get_metric(reset=reset)
+        if self._logs["dal_loss"] is not None: 
+            all_metrics["dal_loss"] = self._logs["dal_loss"].get_metric(reset=reset)
 
         if not self.training:
             all_metrics.update(self._bleu.get_metric(reset=reset))
-            all_metrics.update(self._wer.get_metric(reset=reset))
-            all_metrics["PHN_WER"] = self._phn_wer.get_metric(reset=reset)["WER"]
             all_metrics["UR"] = self._unigram_recall.get_metric(reset=reset)
         return all_metrics
 

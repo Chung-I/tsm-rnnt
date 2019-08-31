@@ -149,9 +149,12 @@ local PTS_READER = {
     //   #"dirac_at_first_step": false
     // },
     "attention": {
-      "type": "bilinear",
+      "type": "stateful",
       "vector_dim": DECODER_HIDDEN_SIZE,
-      "matrix_dim": ENCODER_HIDDEN_SIZE * DIRECTIONS
+      "matrix_dim": ENCODER_HIDDEN_SIZE * DIRECTIONS,
+      "attention_dim": 256,
+      "values_dim": 256,
+      "num_heads" : 8
     },
     "n_pretrain_ctc_epochs": 0,
     "target_namespace": TARGET_NAMESPACE,
