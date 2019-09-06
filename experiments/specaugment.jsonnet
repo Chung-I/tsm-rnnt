@@ -1,7 +1,7 @@
-local BATCH_SIZE = 24;
+local BATCH_SIZE = 32;
 local FRAME_RATE = 1;
-local ENCODER_HIDDEN_SIZE = 1280;
-local DECODER_HIDDEN_SIZE = 1280;
+local ENCODER_HIDDEN_SIZE = 256;
+local DECODER_HIDDEN_SIZE = 256;
 local VOCAB_PATH = "data/vocabulary/phn_level";
 local NUM_GPUS = 1;
 local TARGET_NAMESPACE = "target_tokens";
@@ -14,14 +14,22 @@ local VGG_OUTPUT_SIZE = 80 * (if VGG then (OUT_CHANNEL / STACK_RATE) else 1) * F
 local DIRECTIONS = 2;
 
 
+// local BASE_ITERATOR = {
+//   "type": "homogeneous_batch",
+//   "max_instances_in_memory": 128 * NUM_GPUS,
+//   "batch_size": BATCH_SIZE,
+// //   "sorting_keys": [["source_features", "dimension_0"],
+// //                    [TARGET_NAMESPACE, "num_tokens"]],
+// //                    [PHN_TARGET_NAMESPACE, "num_tokens"],
+// //   "maximum_samples_per_batch": ["dimension_0", 6400],
+//   "track_epoch": true
+// };
 local BASE_ITERATOR = {
-  "type": "homogeneous_batch",
-  "max_instances_in_memory": 128 * NUM_GPUS,
-  "batch_size": BATCH_SIZE,
-//   "sorting_keys": [["source_features", "dimension_0"],
-//                    [TARGET_NAMESPACE, "num_tokens"]],
-//                    [PHN_TARGET_NAMESPACE, "num_tokens"],
-//   "maximum_samples_per_batch": ["dimension_0", 6400],
+  "type": "bucket",
+  "padding_noise": 0.0,
+  "batch_size" : BATCH_SIZE,
+  "sorting_keys": [["source_features", "dimension_0"],
+                    [TARGET_NAMESPACE, "num_tokens"]],
   "track_epoch": true
 };
 
@@ -29,6 +37,7 @@ local TSM_READER = {
   "type": "mao-stt",
   "lazy": true,
   "mmap": true,
+  "discard_energy_dim": true,
   "lexicon_path": "/home/nlpmaster/lexicon.txt",
   "shard_size": BATCH_SIZE,
   "input_stack_rate": FRAME_RATE,
@@ -113,9 +122,9 @@ local PTS_READER = {
     "from_candidates": false,
     "sampling_strategy": "max",
     "joint_ctc_ratio": 0.2,
-    "time_mask_width": 70,
-    "freq_mask_width": 15,
-    "time_mask_max_ratio": 0.2,
+    "time_mask_width": 0,
+    "freq_mask_width": 0,
+    "time_mask_max_ratio": 0.0,
     // "encoder": {
     //   "type": "awd-rnn",
     //   "input_size": 80 * FRAME_RATE,
@@ -138,7 +147,7 @@ local PTS_READER = {
       "type": "residual_bidirectional_lstm",
       "input_size": VGG_OUTPUT_SIZE,
       "hidden_size": ENCODER_HIDDEN_SIZE,
-      "num_layers": 6,
+      "num_layers": 5,
       "layer_dropout_probability": 0.0,
       "use_residual": true
     },
@@ -160,8 +169,8 @@ local PTS_READER = {
       "type": "stateful",
       "vector_dim": DECODER_HIDDEN_SIZE,
       "matrix_dim": ENCODER_HIDDEN_SIZE * DIRECTIONS,
-      "attention_dim": 512,
-      "values_dim": 512,
+      "attention_dim": 256,
+      "values_dim": 256,
       "num_heads" : 1
     },
     "n_pretrain_ctc_epochs": 0,
@@ -185,17 +194,17 @@ local PTS_READER = {
   //                    ["target_tokens", "num_tokens"]],
   //   "track_epoch": true
   // },
-  "iterator": BASE_ITERATOR,
-//   "iterator": {
-//     "type": "multiprocess",
-//     "base_iterator": BASE_ITERATOR,
-//     "num_workers": NUM_THREADS,
-//     "output_queue_size": 1024
-//   },
+  // "iterator": BASE_ITERATOR,
+  "iterator": {
+    "type": "multiprocess",
+    "base_iterator": BASE_ITERATOR,
+    "num_workers": NUM_THREADS,
+    "output_queue_size": 1024
+  },
   "trainer": {
     "num_epochs": 300,
     "patience": 20,
-    "grad_clipping": 3.0,
+    "grad_norm": 4.0,
     "cuda_device": 0,
     "validation_metric": "+BLEU",
     "num_serialized_models_to_keep": 1,
@@ -220,7 +229,7 @@ local PTS_READER = {
       "type": "adamw",
       "lr": 0.0003,
       "amsgrad": true,
-      "weight_decay": 0.01
+      "weight_decay": 1e-6
     }
   }
 }
