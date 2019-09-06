@@ -207,7 +207,7 @@ class PhnMoChA(Model):
         # for the decoder at each time step.
         # TODO (pradeep): Do not hardcode decoder cell type.
         self._decoder = nn.LSTM(self._decoder_input_dim, self._decoder_output_dim,
-                                num_layers=self._dec_layers)
+                                num_layers=self._dec_layers, batch_first=True)
 
         self._num_phn_classes = self.vocab.get_vocab_size(self._phn_target_namespace)
         self._ctc_projection_layer = nn.Linear(self._encoder_output_dim, self._num_phn_classes)
@@ -369,8 +369,6 @@ class PhnMoChA(Model):
         -------
         Dict[str, torch.Tensor]
         """
-        import pdb
-        pdb.set_trace()
         output_dict = {}
         self._cur_dataset = dataset[0]
 
@@ -470,6 +468,12 @@ class PhnMoChA(Model):
                                            att=(1 - self._joint_ctc_ratio),
                                            dal=self._latency_penalty)
 
+        if torch.isnan(output_dict["loss"]).any() or \
+                (torch.abs(output_dict["loss"]) == float('inf')).any():
+            for key, value in output_dict.items():
+                if "loss" in key:
+                    output_dict[key] = output_dict[key].new_zeros(size=(), requires_grad=True).clone()
+
         return output_dict
 
     @overrides
@@ -549,16 +553,16 @@ class PhnMoChA(Model):
             self._encoder.is_bidirectional())
         if self._encoder_output_dim != self._dec_layers * self._decoder_output_dim:
             final_encoder_output = self.bridge(final_encoder_output)
-            initial_decoder_input = final_encoder_output.view(-1, self._dec_layers,
-                                                              self._decoder_output_dim) \
-                                                        .transpose(1, 0)
+        initial_decoder_input = final_encoder_output.view(-1, self._dec_layers,
+                                                          self._decoder_output_dim) \
+                                                          .contiguous()
         # Initialize the decoder hidden state with the final output of the encoder.
         # shape: (batch_size, decoder_output_dim)
         state["decoder_hidden"] = initial_decoder_input
-        state["decoder_output"] = initial_decoder_input[:, 0, :]
+        state["decoder_output"] = initial_decoder_input[:, 0]
         # shape: (batch_size, decoder_output_dim)
         state["decoder_context"] = encoder_outputs.new_zeros(
-            self._dec_layers, batch_size, self._decoder_output_dim)
+            batch_size, self._dec_layers, self._decoder_output_dim)
         state["attention"] = None
         if isinstance(self._attention, StatefulAttention):
             state["att_keys"], state["att_values"] = \
@@ -727,10 +731,13 @@ class PhnMoChA(Model):
         # shape (decoder_hidden): (batch_size, decoder_output_dim)
         # shape (decoder_context): (batch_size, decoder_output_dim)
         outputs, (decoder_hidden, decoder_context) = self._decoder(
-            decoder_input.unsqueeze(0),
-            (decoder_hidden, decoder_context))
+            decoder_input.unsqueeze(1),
+            (decoder_hidden.transpose(1, 0).contiguous(),
+             decoder_context.transpose(1, 0).contiguous()))
 
-        outputs = outputs.squeeze(0)
+        decoder_hidden = decoder_hidden.transpose(1, 0).contiguous()
+        decoder_context = decoder_context.transpose(1, 0).contiguous()
+        outputs = outputs.squeeze(1)
         if self._attention:
             # shape: (group_size, encoder_output_dim)
             attended_output, attention = self._prepare_attended_output(outputs, state)
@@ -861,7 +868,9 @@ class PhnMoChA(Model):
     def _update_metrics(self, output_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         for key, track_func in self._logs.items():
             try:
-                track_func(output_dict[key])
+                value = output_dict[key]
+                value = value.item() if isinstance(value, torch.Tensor) else value
+                track_func(value)
             except KeyError:
                 continue
 
@@ -870,13 +879,13 @@ class PhnMoChA(Model):
         all_metrics: Dict[str, float] = {}
 
         if "phn" in self._cur_dataset:
-            all_metrics["phn_ctc_loss"] = self._logs["phn_ctc_loss"].get_metric(reset=reset).item()
+            all_metrics["phn_ctc_loss"] = self._logs["phn_ctc_loss"].get_metric(reset=reset)
             all_metrics["phn_wer"] = self._phn_wer.get_metric(reset=reset)
         if self._cur_dataset == self._target_namespace:
-            all_metrics["att_loss"] = self._logs["att_loss"].get_metric(reset=reset).item()
+            all_metrics["att_loss"] = self._logs["att_loss"].get_metric(reset=reset)
             all_metrics["att_wer"] = self._wer.get_metric(reset=reset)
         if self._joint_ctc_ratio > 0.0:
-            all_metrics["joint_ctc_loss"] = self._logs["joint_ctc_loss"].get_metric(reset=reset).item()
+            all_metrics["joint_ctc_loss"] = self._logs["joint_ctc_loss"].get_metric(reset=reset)
             all_metrics["ctc_wer"] = self._ctc_wer.get_metric(reset=reset)
         if self._logs["dal_loss"] is not None: 
             all_metrics["dal_loss"] = self._logs["dal_loss"].get_metric(reset=reset)
