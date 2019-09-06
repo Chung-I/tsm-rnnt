@@ -21,6 +21,8 @@ from stt.dataset_readers.utils import pad_and_stack, word_to_phones
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
+CTC_SRC_TGT_LEN_RATIO = 2
+
 def read_dependencies(file_path: str, use_language_specific_pos=False):
 
     annotations = []
@@ -73,6 +75,7 @@ class SpeechToTextDatasetReader(DatasetReader):
                  lexicon_path: str = None,
                  is_phone: bool = False,
                  to_char: bool = False,
+                 discard_energy_dim: bool = False,
                  input_stack_rate: int = 1,
                  model_stack_rate: int = 1,
                  max_frames: int = 3000,
@@ -102,6 +105,7 @@ class SpeechToTextDatasetReader(DatasetReader):
         self._epoch_num = 0
         self._mmap = mmap
         self._dep = dep
+        self._discard_energy_dim = discard_energy_dim
 
         self.lexicon: Dict[str, str] = {}
         if lexicon_path is not None:
@@ -147,8 +151,10 @@ class SpeechToTextDatasetReader(DatasetReader):
         batched_indices = list(range(0, len(source_orders), self._shard_size))
         np.random.shuffle(batched_indices)
         annotation = None
+        order_file = open("orders.txt", "w")
 
         for start_idx in batched_indices:
+            order_file.write(f"{start_idx}\n")
             end_idx = min(start_idx + self._shard_size, len(source_orders))
             for idx in range(start_idx, end_idx):
                 if annotations:
@@ -156,15 +162,19 @@ class SpeechToTextDatasetReader(DatasetReader):
                 if self._bucket or curriculum:
                     idx = source_orders[idx]
                 start, end = source_positions[idx], source_positions[idx+1]
-                src = source_datas[start:end]
+                src = source_datas[start:end, :-1] if self._discard_energy_dim \
+                    else source_datas[start:end, :]
                 tgt = target_datas[idx]
                 if start == end or not tgt.strip():
                     dropped_instances += 1
                     continue
+                if np.isnan(src).any():
+                    print("NaN values in input detected; skipping")
+                    continue
                 instance = self.text_to_instance(src, tgt, annotation)
                 tgt_len = instance.fields['target_tokens'].sequence_length()
                 if tgt_len < 1 or src.shape[0] > self._max_frames \
-                        or (src.shape[0]//self.stack_rate) < tgt_len:
+                        or (src.shape[0] // self.stack_rate) < CTC_SRC_TGT_LEN_RATIO * tgt_len:
                     dropped_instances += 1
                 else:
                     yield instance
@@ -174,6 +184,8 @@ class SpeechToTextDatasetReader(DatasetReader):
         else:
             logger.warning("Dropped {} instances from {}.".format(dropped_instances,
                                                                   file_path))
+        order_file.write("the end of epoch\n")
+        order_file.close()
         self._epoch_num += 1
 
     @overrides
