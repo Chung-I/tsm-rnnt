@@ -90,6 +90,7 @@ class PhnMoChA(Model):
                  input_size: int,
                  target_embedding_dim: int,
                  max_decoding_steps: int,
+                 parser: Model = None,
                  cmvn: bool = True,
                  time_mask_width: int = 0,
                  freq_mask_width: int = 0,
