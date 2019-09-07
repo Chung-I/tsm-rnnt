@@ -30,6 +30,8 @@ local BASE_ITERATOR = {
   "batch_size" : BATCH_SIZE,
   "sorting_keys": [["source_features", "dimension_0"],
                     [TARGET_NAMESPACE, "num_tokens"]],
+  "max_instances_in_memory": BATCH_SIZE,
+  #"maximum_samples_per_batch": ["dimension_0", 36000],
   "track_epoch": true
 };
 
@@ -44,6 +46,7 @@ local TSM_READER = {
   "model_stack_rate": STACK_RATE,
   "bucket": true,
   "is_phone": false,
+  "max_frames": 1500,
   "target_add_start_end_token": true,
   "target_tokenizer": {
     "type": "word",
@@ -186,21 +189,13 @@ local PTS_READER = {
       ["_target_embedder.weight", {"type": "uniform", "a": -1, "b": 1}],
     ]
   },
+  "iterator": BASE_ITERATOR,
   // "iterator": {
-  //   "type": "bucket",
-  //   "padding_noise": 0.0,
-  //   "batch_size" : BATCH_SIZE,
-  //   "sorting_keys": [["source_features", "dimension_0"],
-  //                    ["target_tokens", "num_tokens"]],
-  //   "track_epoch": true
+  //   "type": "multiprocess",
+  //   "base_iterator": BASE_ITERATOR,
+  //   "num_workers": NUM_THREADS,
+  //   "output_queue_size": 1024
   // },
-  // "iterator": BASE_ITERATOR,
-  "iterator": {
-    "type": "multiprocess",
-    "base_iterator": BASE_ITERATOR,
-    "num_workers": NUM_THREADS,
-    "output_queue_size": 1024
-  },
   "trainer": {
     "num_epochs": 300,
     "patience": 20,
