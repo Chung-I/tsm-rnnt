@@ -2,6 +2,8 @@ import librosa
 import soundfile as sf
 import numpy as np
 from stt.predictors import hyperparams as hp
+import torchaudio
+import torch
 
 
 def log_melfilterbank(y, amin=1e-8,
@@ -24,8 +26,9 @@ def read_audio(path, sr=16000):
 
 
 def wavfile_to_feature(wavfile: str):
-
     y, _ = read_audio(wavfile, sr=16000)
     y, _ = librosa.effects.trim(y)
-    feat = log_melfilterbank(y)
+    y = torch.from_numpy(y.reshape(1, -1))
+    y = y.float()
+    feat = torchaudio.compliance.kaldi.fbank(y, num_mel_bins=80, dither=0.0, energy_floor=1.0).numpy()
     return feat
