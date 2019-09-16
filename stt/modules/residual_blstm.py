@@ -1,5 +1,6 @@
 from typing import Optional, Tuple
 import torch
+import torch.nn as nn
 from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
 from allennlp.modules.input_variational_dropout import InputVariationalDropout
 from allennlp.modules.seq2seq_encoders import _Seq2SeqWrapper
@@ -7,7 +8,7 @@ from allennlp.modules.seq2seq_encoders.seq2seq_encoder import Seq2SeqEncoder
 from allennlp.common.checks import ConfigurationError
 
 
-class ResidualBidirectionalLstm(torch.nn.Module):
+class ResidualBidirectionalLstm(nn.Module):
     """
     A standard stacked Bidirectional LSTM where the LSTM layers
     are concatenated between each layer. The only difference between
@@ -60,23 +61,22 @@ class ResidualBidirectionalLstm(torch.nn.Module):
         lstm_input_size = input_size
         for layer_index in range(num_layers):
 
-            layer = torch.nn.LSTM(lstm_input_size, hidden_size,
-                                  num_layers=1,
-                                  batch_first=True,
-                                  bidirectional=True)
+            layer = nn.LSTM(lstm_input_size, hidden_size,
+                            num_layers=1,
+                            batch_first=True,
+                            bidirectional=True)
 
             if use_residual and layer_index < (self.num_layers - 1):
                 if use_residual_projection or lstm_input_size != hidden_size * 2:
-                    residual_projection = torch.nn.Linear(lstm_input_size, hidden_size * 2, bias=False)
+                    residual_projection = nn.Linear(lstm_input_size, hidden_size * 2, bias=False)
                 else:
-                    residual_projection = torch.nn.Identity()
-                self.add_module('res_proj_{}'.format(layer_index), residual_projection)                
+                    residual_projection = nn.Identity()
+                self.add_module('res_proj_{}'.format(layer_index), residual_projection)
 
             lstm_input_size = hidden_size * 2
             self.add_module('layer_{}'.format(layer_index), layer)
-
-
             layers.append(layer)
+
         self.lstm_layers = layers
         self.layer_dropout = InputVariationalDropout(layer_dropout_probability)
 
