@@ -377,6 +377,8 @@ class SloppyTrainer(TrainerBase):
 
                 self._tensorboard.add_train_scalar(
                     "loss/loss_train", metrics["loss"])
+                metrics = training_util.get_metrics(
+                    self.model, train_loss, batches_this_epoch, reset=True)
                 self._tensorboard.log_metrics(
                     {"epoch_metrics/" + k: v for k, v in metrics.items()})
 
@@ -691,9 +693,11 @@ class SloppyTrainer(TrainerBase):
     def from_params(cls,  # type: ignore
                     params: Params,
                     serialization_dir: str,
-                    recover: bool = False) -> 'SloppyTrainer':
+                    recover: bool = False,
+                    cache_directory: str = None,
+                    cache_prefix: str = None) -> 'SloppyTrainer':
         # pylint: disable=arguments-differ
-        from allennlp.training.trainer import TrainerPieces
+        from allennlp.training.trainer_pieces import TrainerPieces
 
         pieces = TrainerPieces.from_params(
             params, serialization_dir, recover)  # pylint: disable=no-member
