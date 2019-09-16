@@ -84,8 +84,6 @@ class BiaffineDependencyParser(Model):
                  input_dropout: float = 0.0,
                  initializer: InitializerApplicator = InitializerApplicator(),
                  regularizer: Optional[RegularizerApplicator] = None) -> None:
-        import pdb
-        pdb.set_trace()
         super(BiaffineDependencyParser, self).__init__(vocab, regularizer)
 
         self.encoder = encoder

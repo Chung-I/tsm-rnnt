@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+from allennlp.nn.util import get_mask_from_sequence_lengths
+
 
 def is_nan_or_inf(x): return (x == np.inf) | (x != x)
 
@@ -56,3 +58,32 @@ def remove_sentence_boundaries(tensor: torch.Tensor,
             new_mask[i, :(j - 2)] = 1
 
     return tensor_without_boundary_tokens, new_mask
+
+def remove_eos(tensor: torch.Tensor,
+               mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    sequence_lengths = mask.sum(dim=1).detach().cpu().numpy()
+    tensor_shape = list(tensor.data.shape)
+    new_shape = list(tensor_shape)
+    new_shape[1] = tensor_shape[1] - 1
+    tensor_without_boundary_tokens = tensor.new_zeros(*new_shape)
+    new_mask = tensor.new_zeros((new_shape[0], new_shape[1]), dtype=torch.bool)
+    for i, j in enumerate(sequence_lengths):
+        if j > 1:
+            tensor_without_boundary_tokens[i, :(j - 1), ...] = tensor[i, :(j - 1), ...]
+            new_mask[i, :(j - 1)] = 1
+
+    return tensor_without_boundary_tokens, new_mask
+
+def char_to_word(tensor: torch.Tensor,
+                 segments: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size, _, feat_dim = tensor.size()
+    segment_lengths, _ = segments.max(dim=-1)
+    max_len = segment_lengths.max()
+    new_tensor = tensor.new_zeros((batch_size, max_len, feat_dim))
+    for i in range(max_len):
+        new_tensor[:, i] = masked_mean(tensor, mask=(
+            (segments == (i+1)).unsqueeze(-1).expand_as(tensor)), dim=1)
+
+    new_tensor.masked_fill(is_nan_or_inf(new_tensor), value=0)
+    return new_tensor, segment_lengths

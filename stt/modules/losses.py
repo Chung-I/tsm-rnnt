@@ -42,7 +42,7 @@ def maybe_sample_from_candidates(probs: torch.FloatTensor,
         mask = (1 - (candidates > 0)).byte().to(probs.device)
         probs = probs.masked_fill(mask, 0)
     if strategy == "sample":
-        predicted_classes = probs.multinomial(1)
+        predicted_classes = probs.multinomial(1).squeeze(1)
     else:
         _, predicted_classes = probs.max(1)
 
@@ -52,12 +52,12 @@ def maybe_sample_from_candidates(probs: torch.FloatTensor,
 class OCDLoss(nn.Module):
     def __init__(self, eos_id, init_temp, end_temp, final_epoch):
 
+        super(OCDLoss, self).__init__()
         self.eos_id = eos_id
         self.temperature = float(init_temp)
         self.init_temp = float(init_temp)
         self.end_temp = float(end_temp)
         self.final_epoch = final_epoch  # num of epoch to reduce temperature to zero
-        super(OCDLoss, self).__init__()
 
     def __call__(self, outputs, output_symbols, targets):
         '''
@@ -73,6 +73,8 @@ class OCDLoss(nn.Module):
         # targets = targets.to(outputs.device)
 
         # output_symbols = torch.stack(output_symbols).squeeze(2)
+        print("todo: make this function batch first")
+        raise NotImplementedError
         seq_len, batch_size, label_size = outputs.size()
 
         outputs_one_hot = to_one_hot(
@@ -113,6 +115,103 @@ class OCDLoss(nn.Module):
                 (self.init_temp - self.end_temp) / \
                 self.final_epoch * float(epoch)
 
+class EDOCDLoss(nn.Module):
+    def __init__(self, eos_id: int, init_temp: float, end_temp: float, final_epoch: int,
+                 average: str = 'batch'):
+
+        super(EDOCDLoss, self).__init__()
+        if average not in {None, "token", "batch"}:
+            raise ValueError("Got average f{average}, expected one of "
+                             "None, 'token', or 'batch'")
+        self.average = average
+        self.eos_id = eos_id
+        self.temperature = float(init_temp)
+        self.init_temp = float(init_temp)
+        self.end_temp = float(end_temp)
+        self.dsub = 1.0
+        self.ddel = 1.0
+        self.dins = 1.0
+        self.kl_div = nn.KLDivLoss(reduction='none')
+        self.final_epoch = final_epoch  # num of epoch to reduce temperature to zero
+
+    def __call__(self, outputs, output_symbols, targets, mask):
+        mask = mask.bool()
+        q_values = self._construct_q_values(outputs, output_symbols, targets, mask)
+        # pred_mask = self._get_pred_mask(output_symbols)
+        pred_mask = mask
+        optimal_policy = torch.softmax(q_values / self.temperature, dim=-1)
+        #loss = torch.sum(
+        #    optimal_policy * (torch.log(optimal_policy+1e-8) - outputs), dim=-1) * pred_mask.float()
+        loss = self.kl_div(outputs, optimal_policy).sum(dim=-1) * pred_mask.float()
+        weights_batch_sum = pred_mask.float().sum(dim=-1)
+        if self.average == 'batch':
+            per_batch_loss = loss.sum(dim=-1) / (weights_batch_sum + 1e-13)
+            num_non_empty_sequences = ((weights_batch_sum > 0).float().sum() + 1e-13)
+            return per_batch_loss.sum() / num_non_empty_sequences
+        elif self.average == 'token':
+            return loss.sum() / (weights_batch_sum.sum() + 1e-13)
+        else:
+            per_batch_loss = loss.sum(dim=-1) / (weights_batch_sum + 1e-13)
+            return per_batch_loss
+
+    def _get_pred_mask(self, output_symbols: torch.LongTensor) -> torch.BoolTensor:
+        batch_size, max_pred_len = output_symbols.size()
+        pred_mask = output_symbols.new_ones((batch_size, max_pred_len), dtype=torch.bool)
+        for i in range(1, max_pred_len):
+            pred_mask[:, i] = pred_mask[:, i - 1] * ~(output_symbols[:, i - 1] == self.eos_id)
+        return pred_mask
+
+    def _construct_q_values(self, outputs: torch.FloatTensor, output_symbols: torch.LongTensor,
+                            targets: torch.LongTensor, mask: torch.BoolTensor) -> torch.FloatTensor:
+        batch_size, max_pred_len, nlabels = outputs.size()
+        _, max_len = targets.size()
+        q_values = outputs.new_zeros((batch_size, max_pred_len, nlabels))
+        distances = self._calculate_edit_distance(output_symbols, targets, mask)
+        # distances = distances[:, :-1, :-1]
+        min_dists, _ = torch.min(distances, dim=-1)
+        truth_values = distances == min_dists.unsqueeze(-1)
+        indices = truth_values.nonzero()
+        extended_targets = targets.repeat(1, max_pred_len) \
+            .view(-1, max_pred_len, max_len)
+        # next_indices = indices.clone()
+        gold_next_tokens = extended_targets[indices.split(1, dim=1)]
+        indices[:, -1] = gold_next_tokens.squeeze(dim=1)
+        q_values[indices.split(1, dim=1)] = 1
+        q_values = q_values - (1 + min_dists).unsqueeze(-1)
+        return q_values
+
+    def _calculate_edit_distance(self, output_symbols: torch.LongTensor,
+                                 targets: torch.LongTensor,
+                                 mask: torch.BoolTensor) -> torch.FloatTensor:
+        batch_size, max_pred_len = output_symbols.size()
+        _, max_len = targets.size()
+
+        distances = output_symbols.new_zeros(batch_size, max_pred_len, max_len)
+        distances[:, :, 0] = torch.arange(max_pred_len)
+        distances[:, 0, :] = torch.arange(max_len)
+        distances = distances.float()
+
+        for i in range(1, max_pred_len):
+            for j in range(1, max_len):
+                diagonal = distances[:, i-1, j-1] + \
+                    self.dsub * (output_symbols[:, i-1] != targets[:, j-1]).float()
+                comp = torch.stack(
+                    (diagonal,
+                     distances[:, i-1, j] + self.dins,
+                     distances[:, i, j-1] + self.ddel), dim=-1)
+                distances[:, i, j], _ = torch.min(comp, dim=-1)
+
+        #edit_distance_mask = self._get_edit_distance_mask(mask, output_symbols)
+        distances = distances.masked_fill(~mask.unsqueeze(1), float('inf'))
+        return distances
+
+    def update_temperature(self, epoch):
+        if epoch >= self.final_epoch:
+            self.temperature = self.end_temp
+        else:
+            self.temperature = self.init_temp - \
+                (self.init_temp - self.end_temp) / \
+                self.final_epoch * float(epoch)
 
 class OrderFreeLoss(nn.Module):
     def __init__(self, eos_id):

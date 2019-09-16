@@ -1,29 +1,33 @@
 local BATCH_SIZE = 32;
 local FRAME_RATE = 1;
-local ENCODER_HIDDEN_SIZE = 256;
-local DECODER_HIDDEN_SIZE = 256;
+local ENCODER_HIDDEN_SIZE = 512;
+local DECODER_HIDDEN_SIZE = 512;
 local VOCAB_PATH = "data/vocabulary/phn_level";
 local NUM_GPUS = 1;
 local TARGET_NAMESPACE = "target_tokens";
+local WORD_TARGET_NAMESPACE = "word_target_tokens";
 local PHN_TARGET_NAMESPACE = "phn_target_tokens";
-local NUM_THREADS = 4;
+local NUM_THREADS = 8;
 local VGG = true;
-local OUT_CHANNEL = 128;
-local STACK_RATE = if VGG then 4 else 1;
-local VGG_OUTPUT_SIZE = 80 * (if VGG then (OUT_CHANNEL / STACK_RATE) else 1) * FRAME_RATE;
+local VGG_LAYERS = 2;
+local OUT_CHANNEL = 32;
+local STACK_RATE = if VGG then std.pow(2, VGG_LAYERS)  else 1;
+local NUM_MELS = 80;
+local VGG_OUTPUT_SIZE = NUM_MELS * (if VGG then (OUT_CHANNEL / STACK_RATE) else 1) * FRAME_RATE;
 local DIRECTIONS = 2;
+local SUMMARY_INTERVAL = 100;
 local ENCODER_OUTPUT_SIZE = ENCODER_HIDDEN_SIZE * DIRECTIONS;
+local CORPUS = "tsm";
+local OCD = true;
 
 local PARSER = {
-      "type": "embedding_biaffine_parser",
-      // "encoder": {
-      //   "type": "stacked_bidirectional_lstm",
-      //   "input_size": 200,
-      //   "hidden_size": 400,
-      //   "num_layers": 3,
-      //   "recurrent_dropout_probability": 0.3,
-      //   "use_highway": true
-      // },
+      "type": "biaffine_parser",
+      "text_field_embedder": {
+        "tokens": {
+          "type": "pass_through",
+          "hidden_dim": ENCODER_OUTPUT_SIZE
+        }
+      },
       "encoder": {
         "type": "pass_through",
         "input_dim": ENCODER_OUTPUT_SIZE
@@ -41,22 +45,37 @@ local PARSER = {
       ]
 };
 
-// local BASE_ITERATOR = {
-//   "type": "homogeneous_batch",
-//   "max_instances_in_memory": 128 * NUM_GPUS,
-//   "batch_size": BATCH_SIZE,
-// //   "sorting_keys": [["source_features", "dimension_0"],
-// //                    [TARGET_NAMESPACE, "num_tokens"]],
-// //                    [PHN_TARGET_NAMESPACE, "num_tokens"],
-// //   "maximum_samples_per_batch": ["dimension_0", 6400],
-//   "track_epoch": true
-// };
+local TAGGER = {
+      "type": "crf_tagger",
+      "text_field_embedder": {
+        "tokens": {
+          "type": "pass_through",
+          "hidden_dim": ENCODER_OUTPUT_SIZE
+        }
+      },
+      "encoder": {
+        "type": "pass_through",
+        "input_dim": ENCODER_OUTPUT_SIZE
+      },
+      "label_namespace": "pos",
+      "dropout": 0.3,
+      "initializer": [
+        #[".*projection.*weight", {"type": "xavier_uniform"}],
+        #[".*projection.*bias", {"type": "zero"}],
+        [".*tag_bilinear.*weight", {"type": "xavier_uniform"}],
+        [".*tag_bilinear.*bias", {"type": "zero"}]
+      ]
+};
+
+
 local BASE_ITERATOR = {
   "type": "bucket",
   "padding_noise": 0.0,
   "batch_size" : BATCH_SIZE,
   "sorting_keys": [["source_features", "dimension_0"],
                     [TARGET_NAMESPACE, "num_tokens"]],
+  "max_instances_in_memory": BATCH_SIZE,
+  #"maximum_samples_per_batch": ["dimension_0", 36000],
   "track_epoch": true
 };
 
@@ -64,13 +83,17 @@ local TSM_READER = {
   "type": "mao-stt",
   "lazy": true,
   "mmap": true,
+  "online": false,
   "discard_energy_dim": true,
+  #"dep": true,
   "lexicon_path": "/home/nlpmaster/lexicon.txt",
   "shard_size": BATCH_SIZE,
   "input_stack_rate": FRAME_RATE,
   "model_stack_rate": STACK_RATE,
   "bucket": true,
   "is_phone": false,
+  "num_mel_bins": NUM_MELS,
+  "max_frames": 1200,
   "target_add_start_end_token": true,
   "target_tokenizer": {
     "type": "word",
@@ -83,9 +106,60 @@ local TSM_READER = {
       "type": "single_id",        
       "namespace": TARGET_NAMESPACE
     }
+  },
+  "word_target_token_indexers": {
+    "words": {
+      "type": "single_id",        
+      "namespace": WORD_TARGET_NAMESPACE
+    }
   }
 };
 
+local FISHER_READER = {
+  "type": "mao-stt",
+  "lazy": true,
+  "mmap": true,
+  "online": false,
+  "discard_energy_dim": true,
+  "dep": false,
+  "lexicon_path": "/home/nlpmaster/lexicon.txt",
+  "fisher_ch": ["/home/nlpmaster/Corpora/fisher_ch/fisher_ch_spa-eng/data", "fisher", "train"],
+  "shard_size": BATCH_SIZE,
+  "input_stack_rate": FRAME_RATE,
+  "model_stack_rate": STACK_RATE,
+  "bucket": true,
+  "is_phone": false,
+  "num_mel_bins": NUM_MELS,
+  "max_frames": 1200,
+  "target_add_start_end_token": true,
+  "target_tokenizer": {
+    "type": "word",
+    "word_splitter": {
+      "type": "just_spaces"
+    }
+  },
+  "target_token_indexers": {
+    "tokens": {
+      "type": "single_id",        
+      "namespace": TARGET_NAMESPACE
+    }
+  },
+  "word_target_token_indexers": {
+    "words": {
+      "type": "single_id",        
+      "namespace": WORD_TARGET_NAMESPACE
+    }
+  }
+};
+
+local VALID_TSM_READER = TSM_READER + {
+    "noskip": true
+};
+
+local VALID_FISHER_READER = FISHER_READER + {
+    "noskip": true,
+    "fisher_ch": ["/home/nlpmaster/Corpora/fisher_ch/fisher_ch_spa-eng/data", "fisher", "dev"]
+};
 
 local PTS_READER = {
   "type": "mao-stt",
@@ -115,6 +189,8 @@ local PTS_READER = {
   "random_seed": 13370,
   "numpy_seed": 1337,
   "pytorch_seed": 133,
+  // "dataset_reader": FISHER_READER,
+  // "validation_dataset_reader": VALID_FISHER_READER,
   "dataset_reader": {
       "type": "interleaving",
       "readers": {
@@ -125,7 +201,7 @@ local PTS_READER = {
   "validation_dataset_reader": {
       "type": "interleaving",
       "readers": {
-          [TARGET_NAMESPACE]: TSM_READER
+          [TARGET_NAMESPACE]: VALID_TSM_READER
       },
       "lazy": true
   },
@@ -134,28 +210,36 @@ local PTS_READER = {
   },
   "train_data_path": |||
     {
-        "target_tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/train_outs"
+        "target_tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/trains"
     }
   |||,
   "validation_data_path": |||
     {
-        "target_tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/valid_outs"
+        "target_tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/valids"
     }
   |||,
+  // "train_data_path": "/home/nlpmaster/Works/egs/fisher_callhome_spanish/s5/data/train/feats.scp",
+  // "validation_data_path": "/home/nlpmaster/Works/egs/fisher_callhome_spanish/s5/data/*dev*/feats.scp",
   "model": {
     "type": "phn_mocha",
-    "input_size": 80 * FRAME_RATE,
-    "cmvn": true,
+    "input_size": NUM_MELS * FRAME_RATE,
+    "cmvn": 'utt',
     "from_candidates": false,
-    "sampling_strategy": "max",
-    "joint_ctc_ratio": 0.2,
+    "sampling_strategy": if OCD then "sample" else "max",
+    "loss_type": if OCD then "edocd" else "nll",
+    "max_decoding_ratio": 1.0,
+    "joint_ctc_ratio": 0.0,
+    "dep_ratio": 0.0,
+    "pos_ratio": 0.0,
+    "ctc_keep_eos": true,
     "time_mask_width": 0,
     "freq_mask_width": 0,
     "time_mask_max_ratio": 0.0,
-    "parser": PARSER,
+    // "dep_parser": PARSER,
+    // "pos_tagger": TAGGER,
     // "encoder": {
     //   "type": "awd-rnn",
-    //   "input_size": 80 * FRAME_RATE,
+    //   "input_size": NUM_MELS * FRAME_RATE,
     //   "hidden_size": ENCODER_HIDDEN_SIZE,
     //   "num_layers": 2,
     //   "dropout": 0.5,
@@ -164,24 +248,28 @@ local PTS_READER = {
     //   "wdrop": 0.0,
     //   "stack_rates": [2, 2],
     // },
-    // "encoder": {
-    //   "type": "lstm",
-    //   "input_size": 80 * FRAME_RATE,
-    //   "hidden_size": ENCODER_HIDDEN_SIZE,
-    //   "num_layers": 6,
-    //   "bidirectional": (DIRECTIONS == 2)
-    // },
     "encoder": {
-      "type": "residual_bidirectional_lstm",
+      "type": "lstm",
       "input_size": VGG_OUTPUT_SIZE,
       "hidden_size": ENCODER_HIDDEN_SIZE,
-      "num_layers": 5,
-      "layer_dropout_probability": 0.0,
-      "use_residual": true
+      "num_layers": 4,
+      "bidirectional": (DIRECTIONS == 2)
     },
-    "dec_layers": 2,
-    "has_vgg": VGG,
-    "vgg_out_channel": OUT_CHANNEL,
+    // "encoder": {
+    //   "type": "residual_bidirectional_lstm",
+    //   "input_size": VGG_OUTPUT_SIZE,
+    //   "hidden_size": ENCODER_HIDDEN_SIZE,
+    //   "num_layers": 4,
+    //   "layer_dropout_probability": 0.0,
+    //   "use_residual": true
+    // },
+    "dec_layers": 1,
+    "cnn": {
+      "type": "cnn",
+      "num_layers": VGG_LAYERS,
+      "in_channel": 1,
+      "hidden_channel": OUT_CHANNEL,
+    },
     "max_decoding_steps": 30,
     "target_embedding_dim": DECODER_HIDDEN_SIZE,
     "beam_size": 5,
@@ -197,8 +285,8 @@ local PTS_READER = {
       "type": "stateful",
       "vector_dim": DECODER_HIDDEN_SIZE,
       "matrix_dim": ENCODER_OUTPUT_SIZE,
-      "attention_dim": 256,
-      "values_dim": 256,
+      "attention_dim": ENCODER_HIDDEN_SIZE,
+      "values_dim": ENCODER_HIDDEN_SIZE,
       "num_heads" : 1
     },
     "n_pretrain_ctc_epochs": 0,
@@ -214,26 +302,19 @@ local PTS_READER = {
       ["_target_embedder.weight", {"type": "uniform", "a": -1, "b": 1}],
     ]
   },
+  "iterator": BASE_ITERATOR,
   // "iterator": {
-  //   "type": "bucket",
-  //   "padding_noise": 0.0,
-  //   "batch_size" : BATCH_SIZE,
-  //   "sorting_keys": [["source_features", "dimension_0"],
-  //                    ["target_tokens", "num_tokens"]],
-  //   "track_epoch": true
+  //   "type": "multiprocess",
+  //   "base_iterator": BASE_ITERATOR,
+  //   "num_workers": NUM_THREADS,
+  //   "output_queue_size": 1024
   // },
-  // "iterator": BASE_ITERATOR,
-  "iterator": {
-    "type": "multiprocess",
-    "base_iterator": BASE_ITERATOR,
-    "num_workers": NUM_THREADS,
-    "output_queue_size": 1024
-  },
   "trainer": {
+    "type": "ignore_nan",
     "num_epochs": 300,
     "patience": 20,
     "grad_norm": 4.0,
-    "cuda_device": -1,
+    "cuda_device": 0,
     "validation_metric": "+BLEU",
     "num_serialized_models_to_keep": 1,
     "should_log_learning_rate": true,
@@ -253,11 +334,17 @@ local PTS_READER = {
       "milestones": [60, 72, 84],
       "gamma": 0.5,
     },
+    // "optimizer": {
+    //   "type": "adamw",
+    //   "lr": 0.0003,
+    //   "amsgrad": true,
+    //   "weight_decay": 1e-6
+    // }
     "optimizer": {
-      "type": "adamw",
-      "lr": 0.0003,
-      "amsgrad": true,
-      "weight_decay": 1e-6
-    }
+      "type": "adadelta",
+      "lr": 1.0,
+      "eps": 1e-8
+    },
+    "summary_interval": SUMMARY_INTERVAL
   }
 }
