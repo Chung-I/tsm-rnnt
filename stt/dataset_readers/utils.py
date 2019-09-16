@@ -1,4 +1,5 @@
-from typing import Tuple, Union
+from typing import Tuple, Union, List
+from pathlib import Path
 
 import math
 import numpy as np
@@ -76,3 +77,30 @@ def pad_and_stack(array: Union[np.ndarray, torch.Tensor],
         new_len = math.ceil(frame_len / input_stack_rate)
         stacked_array = padded_array.reshape(new_shape)
         return stacked_array, new_len
+
+def get_fisher_callhome_transcripts(root: str, corpus: str, split: str,
+                                    src_lang: str = 'es', tgt_lang: str = 'en',
+                                    num_tgt_trns: int = 4
+                                    ) -> Tuple[List[List[str]], List[str], List[List[str]]]:
+    root = Path(root)
+    utt_ids: List[List[str]] = []
+    mapping_dir = "kaldi_mapping"
+    corpus_dir = "corpus"
+    with open(root.joinpath(mapping_dir, f"{corpus}_{split}")) as fp:
+        utt_ids = [line.split(" ") for line in fp.read().splitlines()]
+
+    with open(root.joinpath(corpus_dir, "ldc", f"{corpus}_{split}.{src_lang}")) as fp:
+        src_transcripts = fp.read().splitlines()
+
+    list_of_tgt_transcripts = []
+    if split != 'train':
+        for idx in range(num_tgt_trns):
+            with open(root.joinpath(corpus_dir, "ldc", f"{corpus}_{split}.{tgt_lang}.{idx}")) as fp:
+                tgt_transcripts = fp.read().splitlines()
+                list_of_tgt_transcripts.append(tgt_transcripts)
+    else:
+        with open(root.joinpath(corpus_dir, "ldc", f"{corpus}_{split}.{tgt_lang}")) as fp:
+            tgt_transcripts = fp.read().splitlines()
+            list_of_tgt_transcripts.append(tgt_transcripts)
+
+    return utt_ids, src_transcripts, list_of_tgt_transcripts

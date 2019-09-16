@@ -1,21 +1,27 @@
-from typing import Dict, Iterable, List, Tuple, Any
+from typing import Dict, Iterable, List, Tuple, Any, Union, Callable
 import logging
 import os
 import re
+import functools
+import tqdm
 
 import numpy as np
 from opencc import OpenCC
 from overrides import overrides
 from conllu import parse_incr
+import torch
+import torchaudio
+import kaldi_io
 
 from allennlp.common.util import START_SYMBOL, END_SYMBOL
 from allennlp.data.dataset_readers.dataset_reader import DatasetReader
-from allennlp.data.fields import TextField, ArrayField, MetadataField, LabelField
+from allennlp.data.fields import Field, TextField, ArrayField, MetadataField
+from allennlp.data.fields import LabelField, SequenceLabelField, ListField
 from allennlp.data.instance import Instance
 from allennlp.data.tokenizers import Tokenizer, WordTokenizer, Token
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
 
-from stt.dataset_readers.utils import pad_and_stack, word_to_phones
+from stt.dataset_readers.utils import pad_and_stack, word_to_phones, get_fisher_callhome_transcripts
 
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
@@ -23,11 +29,26 @@ logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 CTC_SRC_TGT_LEN_RATIO = 2
 
+def get_iterator(dataset_size: int, shard_size: int, bucket: bool = True):
+    if bucket:
+        batch_indices = list(range(0, dataset_size, shard_size))
+        np.random.shuffle(batch_indices)
+        for batch_idx in batch_indices:
+            end = min(batch_idx + shard_size, dataset_size)
+            for idx in range(batch_idx, end):
+                yield idx
+    else:
+        indices = list(range(dataset_size))
+        np.random.shuffle(indices)
+        for idx in indices:
+            yield idx
+
+
 def read_dependencies(file_path: str, use_language_specific_pos=False):
 
     annotations = []
-    with open(os.path.join(file_path, "dep.txt"), "r") as conllu_file:
-        for annotation in parse_incr(conllu_file):
+    with open(os.path.join(file_path, "dep.conll"), "r") as conllu_file:
+        for annotation in tqdm.tqdm(parse_incr(conllu_file)):
             annotation = [x for x in annotation if isinstance(x["id"], int)]
 
             heads = [x["head"] for x in annotation]
@@ -40,6 +61,87 @@ def read_dependencies(file_path: str, use_language_specific_pos=False):
             annotations.append([heads, tags, words, pos_tags])
 
     return annotations
+
+def data_func_factory(data_gen, orders):
+    def data_func(idx):
+        if orders is not None:
+            idx = orders[idx]
+        return data_gen(idx)
+    
+    return data_func
+
+def mao_get_datas(file_path: str, online: bool = False,
+                  mmap: bool = True, dep: bool = False) -> Tuple[Callable, Callable, Callable, int]:
+    source_orders = None
+    try:
+        source_lens = np.load(os.path.join(file_path, 'lens.npy'))
+        source_positions = np.pad(source_lens, pad_width=(1, 0), mode='constant') \
+            .cumsum()
+        source_orders = np.argsort(source_lens)
+
+    except FileNotFoundError:
+        logger.warning(f"lens.npy not found under directory {file_path}; bucketing won't take effect.")
+
+    if not online:
+        if mmap:
+            source_datas = np.load(os.path.join(
+                file_path, 'data.npy'), mmap_mode='r')
+        else:
+            source_datas = np.load(os.path.join(
+                file_path, 'data.npy'))
+
+        src_data_gen = lambda idx: source_datas[source_positions[idx]:source_positions[idx+1], :]
+
+    else:
+        with open(os.path.join(file_path, "refs.txt")) as f:
+            source_datas = [os.path.join(file_path, wav) for wav in f.read().splitlines()]
+            src_data_gen = lambda idx: source_datas[idx]
+
+    with open(os.path.join(file_path, "trn.txt")) as f:
+        target_datas = f.read().splitlines()
+
+    src_data_func = data_func_factory(src_data_gen, source_orders)
+    tgt_data_func = data_func_factory(lambda idx: target_datas[idx], source_orders)
+
+    annotations = None
+    if dep:
+        annotations = read_dependencies(file_path)
+
+    anno_data_func = data_func_factory(lambda idx: annotations[idx] if annotations else None,
+                                       source_orders)
+
+    return src_data_func, tgt_data_func, anno_data_func, len(source_orders)
+
+def kaldi_get_datas(file_path: str, targets: List[Tuple[str]],
+                    dep: bool = False) -> Tuple[Callable, Callable, Callable, int]:
+    raw_src_datas: Dict[str, np.array] = {k: m for k, m in kaldi_io.read_mat_scp(file_path)}
+    source_datas = []
+    target_datas = []
+    for utt_ids, src_trns, *tgt_trns in targets:
+        utt_datas = []
+        for utt_id in utt_ids:
+            utt_datas.append(raw_src_datas[utt_id])
+        source_data = np.concatenate((utt_datas), axis=-1)
+        source_datas.append(source_data)
+        target_datas.append(tgt_trns[0])
+
+    src_lens = [src.shape[0] for src in source_datas]
+    source_orders = np.argsort(src_lens)
+
+    src_data_func = data_func_factory(lambda idx: source_datas[idx], source_orders)
+    tgt_data_func = data_func_factory(lambda idx: target_datas[idx], source_orders)
+
+    annotations = None
+    if dep:
+        annotations = read_dependencies(file_path)
+
+    anno_data_func = data_func_factory(lambda idx: annotations[idx] if annotations else None,
+                                       source_orders)
+
+    return src_data_func, tgt_data_func, anno_data_func, len(source_orders)
+
+def flatten(l):
+    return [item for sublist in l for item in sublist]
 
 @DatasetReader.register("mao-stt")
 class SpeechToTextDatasetReader(DatasetReader):
@@ -73,6 +175,7 @@ class SpeechToTextDatasetReader(DatasetReader):
     def __init__(self,
                  shard_size: int,
                  lexicon_path: str = None,
+                 fisher_ch: Tuple[str, str, str] = None,
                  is_phone: bool = False,
                  to_char: bool = False,
                  discard_energy_dim: bool = False,
@@ -81,16 +184,22 @@ class SpeechToTextDatasetReader(DatasetReader):
                  max_frames: int = 3000,
                  target_tokenizer: Tokenizer = None,
                  target_token_indexers: Dict[str, TokenIndexer] = None,
+                 word_target_token_indexers: Dict[str, TokenIndexer] = None,
                  target_add_start_end_token: bool = False,
                  delimiter: str = "\t",
                  curriculum: List[Tuple[int, int]] = None,
+                 online: bool = False,
+                 num_mel_bins: int = 80,
                  mmap: bool = True,
                  dep: bool = False,
                  bucket: bool = False,
+                 noskip: bool = False,
                  lazy: bool = False) -> None:
         super().__init__(lazy)
         self._target_tokenizer = target_tokenizer or WordTokenizer()
         self._target_token_indexers = target_token_indexers or {
+            "tokens": SingleIdTokenIndexer()}
+        self._word_target_token_indexers = word_target_token_indexers or {
             "tokens": SingleIdTokenIndexer()}
         self._delimiter = delimiter
         self._shard_size = shard_size
@@ -106,6 +215,9 @@ class SpeechToTextDatasetReader(DatasetReader):
         self._mmap = mmap
         self._dep = dep
         self._discard_energy_dim = discard_energy_dim
+        self._online = online
+        self._num_mel_bins = num_mel_bins
+        self._noskip = noskip
 
         self.lexicon: Dict[str, str] = {}
         if lexicon_path is not None:
@@ -118,88 +230,106 @@ class SpeechToTextDatasetReader(DatasetReader):
         self.w2p = word_to_phones(self.lexicon)
         self._is_phone = is_phone
         self._to_char = to_char
+        self._fisher_callhome_datas = None
+
+        if fisher_ch is not None:
+            root, corpus, split = fisher_ch
+            self._fisher_callhome_datas = \
+                get_fisher_callhome_transcripts(root, corpus, split)
 
     @overrides
     def _read(self, file_path: str) -> Iterable[Instance]:
         # pylint: disable=arguments-differ
         logger.info('Loading data from %s', file_path)
         dropped_instances = 0
-        if self._mmap:
-            source_datas = np.load(os.path.join(
-                file_path, 'data.npy'), mmap_mode='r')
+
+        if self._fisher_callhome_datas is None:
+            source_datas, target_datas, annotations, dataset_size = \
+                mao_get_datas(file_path, self._online, self._mmap, self._dep)
         else:
-            source_datas = np.load(os.path.join(
-                file_path, 'data.npy'))
-        source_lens = np.load(os.path.join(file_path, 'lens.npy'))
-        source_positions = np.pad(source_lens, pad_width=(1, 0), mode='constant') \
-            .cumsum()
-        with open(os.path.join(file_path, "trn.txt")) as f:
-            target_datas = f.read().splitlines()
+            utt_ids, src_trns, list_of_tgt_trns = self._fisher_callhome_datas
+            targets = zip(utt_ids, src_trns, *list_of_tgt_trns)
+            source_datas, target_datas, annotations, dataset_size = \
+                kaldi_get_datas(file_path, targets, self._dep)
 
-        annotations = []
-        if self._dep:
-            annotations = read_dependencies(file_path)
+        iterator = get_iterator(dataset_size, self._shard_size, self._bucket)
 
-        max_src_len = self.get_max_src_len()
-        curriculum = max_src_len < np.inf
-
-        source_orders = np.argsort(source_lens)
-
-        source_orders = [
-            idx for idx in source_orders if source_lens[idx] < max_src_len]
-
-        batched_indices = list(range(0, len(source_orders), self._shard_size))
-        np.random.shuffle(batched_indices)
-        annotation = None
-        order_file = open("orders.txt", "w")
-
-        for start_idx in batched_indices:
-            order_file.write(f"{start_idx}\n")
-            end_idx = min(start_idx + self._shard_size, len(source_orders))
-            for idx in range(start_idx, end_idx):
-                if annotations:
-                    annotation = annotations[idx]
-                if self._bucket or curriculum:
-                    idx = source_orders[idx]
-                start, end = source_positions[idx], source_positions[idx+1]
-                src = source_datas[start:end, :-1] if self._discard_energy_dim \
-                    else source_datas[start:end, :]
-                tgt = target_datas[idx]
-                if start == end or not tgt.strip():
-                    dropped_instances += 1
-                    continue
-                if np.isnan(src).any():
-                    print("NaN values in input detected; skipping")
-                    continue
+        for idx in iterator:
+            drop = False
+            src = source_datas(idx)
+            tgt = target_datas(idx)
+            annotation = annotations(idx)
+            if src.shape[0] == 0 or not tgt.strip():
+                drop = True
+            else:
                 instance = self.text_to_instance(src, tgt, annotation)
+                source_tensor = instance.fields["source_features"].array
+                src_len = source_tensor.shape[0]
                 tgt_len = instance.fields['target_tokens'].sequence_length()
-                if tgt_len < 1 or src.shape[0] > self._max_frames \
-                        or (src.shape[0] // self.stack_rate) < CTC_SRC_TGT_LEN_RATIO * tgt_len:
-                    dropped_instances += 1
-                else:
-                    yield instance
-                del instance
+                if tgt_len < 1 or src_len > self._max_frames \
+                        or (src_len // self.stack_rate) < CTC_SRC_TGT_LEN_RATIO * tgt_len \
+                        or np.isnan(source_tensor).any():
+                    drop = True
+            if not self._noskip and drop:
+                dropped_instances += 1
+                continue
+            yield instance
+            del instance
+
         if not dropped_instances:
             logger.info("No instances dropped from {}.".format(file_path))
         else:
             logger.warning("Dropped {} instances from {}.".format(dropped_instances,
                                                                   file_path))
-        order_file.write("the end of epoch\n")
-        order_file.close()
         self._epoch_num += 1
+
+    def _text_to_dep_fields(self,
+                            words: List[str],
+                            upos_tags: List[str],
+                            dependencies: List[Tuple[str, int]] = None) -> Instance:
+
+        fields: Dict[str, Field] = {}
+
+        tokens = [Token(t) for t in words]
+
+        text_field = TextField(tokens, self._word_target_token_indexers)
+        fields["words"] = text_field
+
+        fields["pos_tags"] = SequenceLabelField(upos_tags, text_field, label_namespace="pos")
+        if dependencies is not None:
+            # We don't want to expand the label namespace with an additional dummy token, so we'll
+            # always give the 'ROOT_HEAD' token a label of 'root'.
+            fields["head_tags"] = SequenceLabelField([x[0] for x in dependencies],
+                                                        text_field,
+                                                        label_namespace="head_tags")
+            fields["head_indices"] = SequenceLabelField([x[1] for x in dependencies],
+                                                        text_field,
+                                                        label_namespace="head_index_tags")
+
+        fields["metadata"] = MetadataField({"words": words, "pos": upos_tags})
+
+        return fields
 
     @overrides
     def text_to_instance(self,
-                         source_array: np.ndarray,
+                         source: Union[np.ndarray, str],
                          target_string: str = None,
                          annotation: List[Any] = None) -> Instance:  # type: ignore
         # pylint: disable=arguments-differ
-        source_array, src_len = pad_and_stack(source_array,
-                                              self.input_stack_rate,
-                                              self.model_stack_rate,
-                                              pad_mode=self._pad_mode)
+        if isinstance(source, str):
+            source, _ = torchaudio.load(source)
+            source = torchaudio.compliance.kaldi.fbank(source,
+                                                       use_energy=(not self._discard_energy_dim),
+                                                       num_mel_bins=self._num_mel_bins,
+                                                       dither=0.0, energy_floor=1.0).numpy()
+
+        source, src_len = pad_and_stack(source,
+                                        self.input_stack_rate,
+                                        self.model_stack_rate,
+                                        pad_mode=self._pad_mode)
+
         source_length_field = LabelField(src_len, skip_indexing=True)
-        source_field = ArrayField(source_array)
+        source_field = ArrayField(source)
 
         if target_string is not None:
             char_target = [Token(x) for x in list(re.sub(r"\s+", "", target_string))]
@@ -212,38 +342,31 @@ class SpeechToTextDatasetReader(DatasetReader):
                     word = self.cc.convert(word)
                     phn_target.extend(self.w2p(word))
 
-                # if self._target_add_start_end_token:
-                #     phn_target.insert(0, START_SYMBOL)
-                #     phn_target.append(END_SYMBOL)
-                phn_target_field = TextField([Token(x) for x in phn_target], {
-                    "tokens": SingleIdTokenIndexer()})
-
             if self._target_add_start_end_token:
-                target.insert(0, Token(START_SYMBOL))
-                target.append(Token(END_SYMBOL))
+                if self._to_char:
+                    target.insert(0, Token(START_SYMBOL))
+                    target.append(Token(END_SYMBOL))
+                else:
+                    char_target.insert(0, Token(START_SYMBOL))
+                    char_target.append(Token(END_SYMBOL))
 
-            target_field = TextField(
-                target, self._target_token_indexers)
-            char_target_field = TextField(char_target, {
-                "tokens": SingleIdTokenIndexer()})
-            #print(target, char_target, phn_target)
-            return Instance({"source_features": source_field,
-                             "target_tokens": target_field,
-                             #"target_phn_tokens": phn_target_field,
-                             #"target_char_tokens": char_target_field,
-                             "transcripts": MetadataField(target_string),
-                             "source_lengths": source_length_field})
+            char_target_field = TextField(char_target,
+                                          self._target_token_indexers)
+
+            fields = {"source_features": source_field,
+                      "target_tokens": char_target_field,
+                      "source_lengths": source_length_field}
+
+            if self._dep and annotation is not None:
+                heads, tags, words, pos_tags = annotation
+                dep_fields = self._text_to_dep_fields(words, pos_tags, list(zip(tags, heads)))
+                segments = [0] + flatten([[idx + 1] * len(word) for idx, word in enumerate(words)]) + [0]
+                fields["segments"] = SequenceLabelField(segments, char_target_field,
+                                                        label_namespace="segment_labels")
+                fields.update(dep_fields)
+
+            return Instance(fields)
 
         else:
             return Instance({"source_features": source_field,
                              "source_lengths": source_length_field})
-
-    def get_max_src_len(self):
-        max_len = np.inf
-        if self._curriculum is not None:
-            for epoch, cur_max_len in self._curriculum:
-                if self._epoch_num < epoch:
-                    break
-                max_len = cur_max_len
-
-        return max_len
