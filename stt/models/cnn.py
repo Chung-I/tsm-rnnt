@@ -1,8 +1,13 @@
+from typing import Tuple
+from overrides import overrides
+from collections import OrderedDict
+from functools import reduce
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from allennlp.nn.util import get_mask_from_sequence_lengths
+from allennlp.modules.seq2seq_encoders.seq2seq_encoder import Seq2SeqEncoder
 
 
 class LengthAwareWrapper(nn.Module):
@@ -26,23 +31,25 @@ class LengthAwareWrapper(nn.Module):
             if isinstance(self.module.stride, tuple) \
             else self.module.stride
 
-    def forward(self, inputs: torch.FloatTensor, lengths: torch.LongTensor):
+    @overrides
+    def forward(self, input: Tuple[torch.FloatTensor, torch.LongTensor]):
         """
         Expect inputs of (N, C, T, D) dimension.
         There's something peculiar here in that we made the padding affects our length
         only at the start position, so that 2 * self.padding becomes 1 * self.padding.
         """
+        inputs, lengths = input
         lengths = torch.floor(
             torch.clamp(
-                (lengths.float() + 1 * self.padding - self.dilation *
+                (lengths.float() + 2 * self.padding - self.dilation *
                  (self.kernel_size - 1) - 1) / self.stride + 1,
                 1.
             )
         ).long()
         outputs = self.module.forward(inputs)
-        return outputs, lengths
+        return (outputs, lengths)
 
-
+@Seq2SeqEncoder.register("vgg")
 class VGGExtractor(nn.Module):
     def __init__(self, in_channel, out_channel):
         super(VGGExtractor, self).__init__()
@@ -63,6 +70,7 @@ class VGGExtractor(nn.Module):
         self.pool2 = LengthAwareWrapper(
             nn.MaxPool2d(2, stride=2))  # Half-time dimension
 
+    @overrides
     def forward(self, feature, lengths):
         # Feature shape BSxTxD -> BS x CH(num of delta) x T x D(acoustic feature dim)
         batch_size, _, feat_dim = feature.size()
@@ -82,4 +90,54 @@ class VGGExtractor(nn.Module):
         #  BS x T/4 x 64 x D/4 -> BS x T/4 x 16D
         feature = feature.reshape(
             batch_size, -1, feat_dim * self.out_channel // 4)
+        return feature, lengths
+
+@Seq2SeqEncoder.register("cnn")
+class CNN(Seq2SeqEncoder):
+    def __init__(self, num_layers: int, in_channel: int, hidden_channel: int,
+                 kernel_size: int = 3, stride: int = 2):
+        super(CNN, self).__init__()
+        self._in_channel = in_channel
+        self._hidden_channel = hidden_channel
+        self._kernel_size = kernel_size
+        self._stride = stride
+        self._num_layers = num_layers
+
+        self.module = nn.Sequential(
+            OrderedDict([("conv1",
+                          LengthAwareWrapper(
+                              nn.Conv2d(self._in_channel, self._hidden_channel,
+                                        self._kernel_size, stride=self._stride, padding=1)
+                        ))] +
+                        [(f"conv{idx}", LengthAwareWrapper(
+                            nn.Conv2d(self._hidden_channel, self._hidden_channel,
+                                      self._kernel_size, stride=self._stride, padding=1)
+                        )) for idx in range(2, self._num_layers + 1)]
+            )
+        )
+        strides = [self.module[idx].stride for idx in range(len(self.module))]
+        self._downsample_rate = reduce(lambda x, y: x * y, strides)
+
+    @overrides
+    def get_input_dim(self) -> int:
+        return self._in_channel
+
+    @overrides
+    def get_output_dim(self) -> int:
+        return self._hidden_channel
+
+    @overrides
+    def is_bidirectional(self) -> bool:
+        return False
+
+    @overrides
+    def forward(self, feature, lengths):
+        # Feature shape BSxTxD -> BS x CH(num of delta) x T x D(acoustic feature dim)
+        batch_size, _, feat_dim = feature.size()
+        feature = feature.unsqueeze(1)
+        feature, lengths = self.module((feature, lengths))
+        feature = feature.transpose(1, 2)
+        #  BS x T/4 x 64 x D/4 -> BS x T/4 x 16D
+        feature = feature.reshape(
+            batch_size, -1, feat_dim * self._hidden_channel // self._downsample_rate)
         return feature, lengths
