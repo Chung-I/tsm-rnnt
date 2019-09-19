@@ -27,7 +27,9 @@ class OnlineSpeechToTextPredictor(Predictor):
         self._dataset_reader = dataset_reader
 
     def load_line(self, line: str) -> JsonDict:
-        wav, target_string = line[:-1].split()
+        idx = line[:-1].index(" ")
+        wav = line[:idx]
+        target_string = line[idx+1:]
         return {"wav": wav, "target_string": target_string}
 
     def predict(self,
