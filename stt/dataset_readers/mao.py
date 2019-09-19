@@ -22,7 +22,8 @@ from allennlp.data.tokenizers import Tokenizer, WordTokenizer, Token
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
 
 from stt.dataset_readers.utils import pad_and_stack, word_to_phones, get_fisher_callhome_transcripts
-
+from stt.data.characters_indexer import CharactersIndexer
+from stt.data.phoneme_tokenizer import PhonemeTokenizer
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -67,7 +68,7 @@ def data_func_factory(data_gen, orders):
         if orders is not None:
             idx = orders[idx]
         return data_gen(idx)
-    
+
     return data_func
 
 def mao_get_datas(file_path: str, online: bool = False,
@@ -176,15 +177,13 @@ class SpeechToTextDatasetReader(DatasetReader):
                  shard_size: int,
                  lexicon_path: str = None,
                  fisher_ch: Tuple[str, str, str] = None,
-                 is_phone: bool = False,
-                 to_char: bool = False,
+                 word_level: bool = False,
                  discard_energy_dim: bool = False,
                  input_stack_rate: int = 1,
                  model_stack_rate: int = 1,
                  max_frames: int = 3000,
                  target_tokenizer: Tokenizer = None,
                  target_token_indexers: Dict[str, TokenIndexer] = None,
-                 word_target_token_indexers: Dict[str, TokenIndexer] = None,
                  target_add_start_end_token: bool = False,
                  delimiter: str = "\t",
                  curriculum: List[Tuple[int, int]] = None,
@@ -198,9 +197,9 @@ class SpeechToTextDatasetReader(DatasetReader):
         super().__init__(lazy)
         self._target_tokenizer = target_tokenizer or WordTokenizer()
         self._target_token_indexers = target_token_indexers or {
-            "tokens": SingleIdTokenIndexer()}
-        self._word_target_token_indexers = word_target_token_indexers or {
-            "tokens": SingleIdTokenIndexer()}
+            "tokens": SingleIdTokenIndexer(start_tokens=[START_SYMBOL], end_tokens=[END_SYMBOL]),
+            "token_characters": CharactersIndexer()
+        }
         self._delimiter = delimiter
         self._shard_size = shard_size
         self.input_stack_rate = input_stack_rate
@@ -219,17 +218,21 @@ class SpeechToTextDatasetReader(DatasetReader):
         self._num_mel_bins = num_mel_bins
         self._noskip = noskip
 
-        self.lexicon: Dict[str, str] = {}
+        cc = OpenCC('s2t')
         if lexicon_path is not None:
+            lexicon: Dict[str, str] = {}
             with open(lexicon_path) as f:
                 for line in f.read().splitlines():
                     end, start = re.search(r'\s+', line).span()
-                    self.lexicon[line[:end]] = line[start:]
+                    lexicon[line[:end]] = line[start:]
+            w2p = word_to_phones(lexicon)
+            phonemizer = lambda word: w2p(cc.convert(word))
+            phn_tokenizer = PhonemeTokenizer(phonemizer)
+            self._target_token_indexers["phonemes"] = \
+                CharactersIndexer(namespace='phonemes',
+                                  character_tokenizer=phn_tokenizer)
 
-        self.cc = OpenCC('s2t')
-        self.w2p = word_to_phones(self.lexicon)
-        self._is_phone = is_phone
-        self._to_char = to_char
+        self._word_level = word_level
         self._fisher_callhome_datas = None
 
         if fisher_ch is not None:
@@ -292,7 +295,7 @@ class SpeechToTextDatasetReader(DatasetReader):
 
         tokens = [Token(t) for t in words]
 
-        text_field = TextField(tokens, self._word_target_token_indexers)
+        text_field = TextField(tokens, self._target_token_indexers)
         fields["words"] = text_field
 
         fields["pos_tags"] = SequenceLabelField(upos_tags, text_field, label_namespace="pos")
@@ -332,36 +335,20 @@ class SpeechToTextDatasetReader(DatasetReader):
         source_field = ArrayField(source)
 
         if target_string is not None:
-            char_target = [Token(x) for x in list(re.sub(r"\s+", "", target_string))]
             target = self._target_tokenizer.tokenize(target_string)
 
-            if self.lexicon:
-                phn_target: List[str] = []
-                tokenized_target = [word.text for word in target]
-                for word in tokenized_target:
-                    word = self.cc.convert(word)
-                    phn_target.extend(self.w2p(word))
-
-            if self._target_add_start_end_token:
-                if self._to_char:
-                    target.insert(0, Token(START_SYMBOL))
-                    target.append(Token(END_SYMBOL))
-                else:
-                    char_target.insert(0, Token(START_SYMBOL))
-                    char_target.append(Token(END_SYMBOL))
-
-            char_target_field = TextField(char_target,
-                                          self._target_token_indexers)
+            target_field = TextField(target,
+                                     self._target_token_indexers)
 
             fields = {"source_features": source_field,
-                      "target_tokens": char_target_field,
+                      "target_tokens": target_field,
                       "source_lengths": source_length_field}
 
             if self._dep and annotation is not None:
                 heads, tags, words, pos_tags = annotation
                 dep_fields = self._text_to_dep_fields(words, pos_tags, list(zip(tags, heads)))
                 segments = [0] + flatten([[idx + 1] * len(word) for idx, word in enumerate(words)]) + [0]
-                fields["segments"] = SequenceLabelField(segments, char_target_field,
+                fields["segments"] = SequenceLabelField(segments, target_field,
                                                         label_namespace="segment_labels")
                 fields.update(dep_fields)
 

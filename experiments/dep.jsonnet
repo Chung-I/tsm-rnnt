@@ -4,9 +4,11 @@ local ENCODER_HIDDEN_SIZE = 512;
 local DECODER_HIDDEN_SIZE = 512;
 local VOCAB_PATH = "data/vocabulary/phn_level";
 local NUM_GPUS = 1;
-local TARGET_NAMESPACE = "target_tokens";
-local WORD_TARGET_NAMESPACE = "word_target_tokens";
-local PHN_TARGET_NAMESPACE = "phn_target_tokens";
+local CHAR_TARGET_NAMESPACE = "characters";
+local WORD_TARGET_NAMESPACE = "tokens";
+local PHN_TARGET_NAMESPACE = "phonemes";
+local WORD_LEVEL = false;
+local TARGET_NAMESPACE = if WORD_LEVEL then WORD_TARGET_NAMESPACE else CHAR_TARGET_NAMESPACE;
 local NUM_THREADS = 8;
 local VGG = true;
 local VGG_LAYERS = 2;
@@ -18,7 +20,7 @@ local DIRECTIONS = 2;
 local SUMMARY_INTERVAL = 100;
 local ENCODER_OUTPUT_SIZE = ENCODER_HIDDEN_SIZE * DIRECTIONS;
 local CORPUS = "tsm";
-local OCD = true;
+local OCD = false;
 
 local PARSER = {
       "type": "biaffine_parser",
@@ -73,7 +75,7 @@ local BASE_ITERATOR = {
   "padding_noise": 0.0,
   "batch_size" : BATCH_SIZE,
   "sorting_keys": [["source_features", "dimension_0"],
-                    [TARGET_NAMESPACE, "num_tokens"]],
+                    ["target_tokens", "num_tokens"]],
   "max_instances_in_memory": BATCH_SIZE,
   #"maximum_samples_per_batch": ["dimension_0", 36000],
   "track_epoch": true
@@ -81,6 +83,7 @@ local BASE_ITERATOR = {
 
 local TSM_READER = {
   "type": "mao-stt",
+  "word_level": false,
   "lazy": true,
   "mmap": true,
   "online": false,
@@ -91,7 +94,6 @@ local TSM_READER = {
   "input_stack_rate": FRAME_RATE,
   "model_stack_rate": STACK_RATE,
   "bucket": true,
-  "is_phone": false,
   "num_mel_bins": NUM_MELS,
   "max_frames": 1200,
   "target_add_start_end_token": true,
@@ -104,13 +106,15 @@ local TSM_READER = {
   "target_token_indexers": {
     "tokens": {
       "type": "single_id",        
-      "namespace": TARGET_NAMESPACE
-    }
-  },
-  "word_target_token_indexers": {
-    "words": {
-      "type": "single_id",        
-      "namespace": WORD_TARGET_NAMESPACE
+      "namespace": WORD_TARGET_NAMESPACE,
+      "start_tokens": ["@start@"],
+      "end_tokens": ["@end@"]
+    },
+    "characters": {
+      "type": "just-characters",
+      "namespace": CHAR_TARGET_NAMESPACE,
+      "start_tokens": ["@start@"],
+      "end_tokens": ["@end@"]
     }
   }
 };
@@ -128,7 +132,6 @@ local FISHER_READER = {
   "input_stack_rate": FRAME_RATE,
   "model_stack_rate": STACK_RATE,
   "bucket": true,
-  "is_phone": false,
   "num_mel_bins": NUM_MELS,
   "max_frames": 1200,
   "target_add_start_end_token": true,
@@ -140,12 +143,6 @@ local FISHER_READER = {
   },
   "target_token_indexers": {
     "tokens": {
-      "type": "single_id",        
-      "namespace": TARGET_NAMESPACE
-    }
-  },
-  "word_target_token_indexers": {
-    "words": {
       "type": "single_id",        
       "namespace": WORD_TARGET_NAMESPACE
     }
@@ -169,7 +166,6 @@ local PTS_READER = {
   "input_stack_rate": FRAME_RATE,
   "model_stack_rate": STACK_RATE,
   "bucket": true,
-  "is_phone": false,
   "target_add_start_end_token": false,
   "target_tokenizer": {
     "type": "word",
@@ -191,33 +187,37 @@ local PTS_READER = {
   "pytorch_seed": 133,
   // "dataset_reader": FISHER_READER,
   // "validation_dataset_reader": VALID_FISHER_READER,
-  "dataset_reader": {
-      "type": "interleaving",
-      "readers": {
-          [TARGET_NAMESPACE]: TSM_READER
-      },
-      "lazy": true
-  },
-  "validation_dataset_reader": {
-      "type": "interleaving",
-      "readers": {
-          [TARGET_NAMESPACE]: VALID_TSM_READER
-      },
-      "lazy": true
-  },
+  "dataset_reader": TSM_READER,
+  "validation_dataset_reader": VALID_TSM_READER,
+  // "dataset_reader": {
+  //     "type": "interleaving",
+  //     "readers": {
+  //         [TARGET_NAMESPACE]: TSM_READER
+  //     },
+  //     "lazy": true
+  // },
+  // "validation_dataset_reader": {
+  //     "type": "interleaving",
+  //     "readers": {
+  //         [TARGET_NAMESPACE]: VALID_TSM_READER
+  //     },
+  //     "lazy": true
+  // },
   "vocabulary": {
     "directory_path": VOCAB_PATH
   },
-  "train_data_path": |||
-    {
-        "target_tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/trains"
-    }
-  |||,
-  "validation_data_path": |||
-    {
-        "target_tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/valids"
-    }
-  |||,
+  // "train_data_path": |||
+  //   {
+  //       "tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/trains"
+  //   }
+  // |||,
+  // "validation_data_path": |||
+  //   {
+  //       "tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/valids"
+  //   }
+  // |||,
+  "train_data_path": "/home/nlpmaster/ssd-1t/corpus/TSM/trains",
+  "validation_data_path": "/home/nlpmaster/ssd-1t/corpus/TSM/valids",
   // "train_data_path": "/home/nlpmaster/Works/egs/fisher_callhome_spanish/s5/data/train/feats.scp",
   // "validation_data_path": "/home/nlpmaster/Works/egs/fisher_callhome_spanish/s5/data/*dev*/feats.scp",
   "model": {
@@ -235,6 +235,7 @@ local PTS_READER = {
     "time_mask_width": 0,
     "freq_mask_width": 0,
     "time_mask_max_ratio": 0.0,
+    "rnnt_dim": ENCODER_OUTPUT_SIZE / 2,
     // "dep_parser": PARSER,
     // "pos_tagger": TAGGER,
     // "encoder": {
@@ -315,7 +316,8 @@ local PTS_READER = {
     "patience": 20,
     "grad_norm": 4.0,
     "cuda_device": 0,
-    "validation_metric": "+BLEU",
+    #"validation_metric": "+BLEU",
+    "validation_metric": "-loss",
     "num_serialized_models_to_keep": 1,
     "should_log_learning_rate": true,
     // "learning_rate_scheduler": {
