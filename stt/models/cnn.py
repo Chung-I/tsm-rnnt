@@ -7,45 +7,49 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from allennlp.nn.activations import Activation
 from allennlp.modules.seq2seq_encoders.seq2seq_encoder import Seq2SeqEncoder
 
 
 class LengthAwareWrapper(nn.Module):
-    def __init__(self, module):
+    def __init__(self, module, pass_through: str = False):
         super(LengthAwareWrapper, self).__init__()
         self.module = module
+        self._pass_through = pass_through
+        if not pass_through:
+            self.padding = self.module.padding[0] \
+                if isinstance(self.module.padding, tuple) \
+                else self.module.padding
 
-        self.padding = self.module.padding[0] \
-            if isinstance(self.module.padding, tuple) \
-            else self.module.padding
+            self.dilation = self.module.dilation[0] \
+                if isinstance(self.module.dilation, tuple) \
+                else self.module.dilation
 
-        self.dilation = self.module.dilation[0] \
-            if isinstance(self.module.dilation, tuple) \
-            else self.module.dilation
+            self.kernel_size = self.module.kernel_size[0] \
+                if isinstance(self.module.kernel_size, tuple) \
+                else self.module.kernel_size
 
-        self.kernel_size = self.module.kernel_size[0] \
-            if isinstance(self.module.kernel_size, tuple) \
-            else self.module.kernel_size
-
-        self.stride = self.module.stride[0] \
-            if isinstance(self.module.stride, tuple) \
-            else self.module.stride
+            self.stride = self.module.stride[0] \
+                if isinstance(self.module.stride, tuple) \
+                else self.module.stride
 
     @overrides
-    def forward(self, input: Tuple[torch.FloatTensor, torch.LongTensor]):
+    def forward(self, inputs_and_lengths: Tuple[torch.FloatTensor, torch.LongTensor]):
+        # pylint: disable=arguments-differ
         """
         Expect inputs of (N, C, T, D) dimension.
         There's something peculiar here in that we made the padding affects our length
         only at the start position, so that 2 * self.padding becomes 1 * self.padding.
         """
-        inputs, lengths = input
-        lengths = torch.floor(
-            torch.clamp(
-                (lengths.float() + 2 * self.padding - self.dilation *
-                 (self.kernel_size - 1) - 1) / self.stride + 1,
-                1.
-            )
-        ).long()
+        inputs, lengths = inputs_and_lengths
+        if not self._pass_through:
+            lengths = torch.floor(
+                torch.clamp(
+                    (lengths.float() + 2 * self.padding - self.dilation *
+                     (self.kernel_size - 1) - 1) / self.stride + 1,
+                    1.
+                )
+            ).long()
         outputs = self.module.forward(inputs)
         return (outputs, lengths)
 
@@ -72,6 +76,7 @@ class VGGExtractor(nn.Module):
 
     @overrides
     def forward(self, feature, lengths):
+        # pylint: disable=arguments-differ
         # Feature shape BSxTxD -> BS x CH(num of delta) x T x D(acoustic feature dim)
         batch_size, _, feat_dim = feature.size()
         feature = feature.unsqueeze(1)
@@ -95,27 +100,25 @@ class VGGExtractor(nn.Module):
 @Seq2SeqEncoder.register("cnn")
 class CNN(Seq2SeqEncoder):
     def __init__(self, num_layers: int, in_channel: int, hidden_channel: int,
-                 kernel_size: int = 3, stride: int = 2):
+                 kernel_size: int = 3, stride: int = 2,
+                 nonlinearity: Activation = Activation.by_name('linear')()):
         super(CNN, self).__init__()
         self._in_channel = in_channel
         self._hidden_channel = hidden_channel
         self._kernel_size = kernel_size
         self._stride = stride
         self._num_layers = num_layers
-
-        self.module = nn.Sequential(
-            OrderedDict([("conv1",
-                          LengthAwareWrapper(
-                              nn.Conv2d(self._in_channel, self._hidden_channel,
-                                        self._kernel_size, stride=self._stride, padding=1)
-                        ))] +
-                        [(f"conv{idx}", LengthAwareWrapper(
-                            nn.Conv2d(self._hidden_channel, self._hidden_channel,
-                                      self._kernel_size, stride=self._stride, padding=1)
-                        )) for idx in range(2, self._num_layers + 1)]
-            )
-        )
-        strides = [self.module[idx].stride for idx in range(len(self.module))]
+        layers = []
+        for l in range(num_layers):
+            in_channel = self._in_channel if l == 0 else self._hidden_channel
+            conv = LengthAwareWrapper(nn.Conv2d(in_channel, self._hidden_channel,
+                                                self._kernel_size, stride=self._stride,
+                                                padding=1))
+            layers.append((f"conv{l}", conv))
+            layers.append((f"nonlinear{l}", LengthAwareWrapper(nonlinearity, pass_through=True)))
+        self.module = nn.Sequential(OrderedDict(layers))
+        strides = [self.module[idx].stride for idx in range(len(self.module))
+                   if hasattr(self.module[idx], "stride")]
         self._downsample_rate = reduce(lambda x, y: x * y, strides)
 
     @overrides
