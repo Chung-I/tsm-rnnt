@@ -1,33 +1,30 @@
 from typing import Dict, Optional, List, Tuple, Any
+from itertools import groupby
 
 import os
 import numpy
 from overrides import overrides
 import torch
-from torch.nn.modules.linear import Linear
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.nn import CTCLoss
 from torchaudio.transforms import MelSpectrogram
 import itertools
 
+from allennlp.common.util import START_SYMBOL, END_SYMBOL, sanitize
 from allennlp.common.checks import check_dimensions_match, ConfigurationError
 from allennlp.data import Vocabulary
 from allennlp.data.vocabulary import DEFAULT_PADDING_TOKEN
-from allennlp.modules import Seq2SeqEncoder, TimeDistributed, TextFieldEmbedder
 from allennlp.models.model import Model
 from allennlp.nn import InitializerApplicator, RegularizerApplicator
-from allennlp.nn.util import get_text_field_mask, sequence_cross_entropy_with_logits, \
-    get_lengths_from_binary_sequence_mask, get_mask_from_sequence_lengths
-from allennlp.training.metrics import BLEU
-from stt.models.cnn import VGGExtractor
-from ds_ctcdecoder import ctc_beam_search_decoder_batch
+from allennlp.nn import util
+from allennlp.modules.token_embedders import Embedding
 
-from stt.data.text import Alphabet
-from stt.training.word_error_rate import WordErrorRate
-
+from stt.models.util import remove_sentence_boundaries
+from stt.training.word_error_rate import WordErrorRate as WER
 
 @Model.register("ctc")
-class CTCModel(Model):
+class CTCLayer(Model):
     """
     This ``SimpleTagger`` simply encodes a sequence of text with a stacked ``Seq2SeqEncoder``, then
     predicts a tag for each token in the sequence.
@@ -59,181 +56,240 @@ class CTCModel(Model):
     """
 
     def __init__(self, vocab: Vocabulary,
-                 encoder: Seq2SeqEncoder,
-                 input_size: int,
-                 cmvn: bool = True,
-                 loss_type: str = "ctc",
-                 layerwise_pretraining: List[Tuple[int, int]] = None,
-                 beam_size: int = 5,
-                 target_namespace: str = "target_tokens",
-                 vocab_path: str = "phonemes/vocabulary",
-                 verbose_metrics: bool = False,
+                 loss_ratio: float = 1.0,
+                 remove_sos: bool = True,
+                 remove_eos: bool = False,
+                 target_namespace: str = "tokens",
                  initializer: InitializerApplicator = InitializerApplicator(),
                  regularizer: Optional[RegularizerApplicator] = None) -> None:
-        super(CTCModel, self).__init__(vocab, regularizer)
-
+        super(CTCLayer, self).__init__(vocab, regularizer)
+        self.loss_ratio = loss_ratio
+        self._remove_sos = remove_sos
+        self._remove_eos = remove_eos
         self._target_namespace = target_namespace
-        self.num_classes = self.vocab.get_vocab_size(target_namespace)
-        self.input_size = input_size
-        self.encoder = encoder
-        self._verbose_metrics = verbose_metrics
-        self.projection_layer = TimeDistributed(Linear(encoder.get_output_dim(),
-                                                       self.num_classes))
+        self._num_classes = self.vocab.get_vocab_size(target_namespace)
+        self._pad_index = self.vocab.get_token_index(
+            DEFAULT_PADDING_TOKEN, self._target_namespace)
+        self._loss = CTCLoss(blank=self._pad_index)
+        self._start_index = self.vocab.get_token_index(
+            START_SYMBOL, self._target_namespace)
+        self._end_index = self.vocab.get_token_index(
+            END_SYMBOL, self._target_namespace)
+        self._wer = WER(exclude_indices={
+            self._pad_index, self._end_index, self._start_index})
 
-        self._blank_idx = self.vocab.get_token_index(DEFAULT_PADDING_TOKEN)
-        self._loss_type = loss_type
-        if self._loss_type == "ctc":
-            self._loss = CTCLoss(blank=self._blank_idx, zero_infinity=False)
-        elif self._loss_type == "warp_ctc":
-            from warpctc_pytorch import CTCLoss as WarpCTCLoss
-            self._loss = WarpCTCLoss(
-                blank=self._blank_idx, length_average=True)
-        elif self._loss_type == "rnnt":
-            from warprnnt_pytorch import RNNTLoss
-            self._loss = RNNTLoss(blank=self._blank_idx)
-
-        self._layerwise_pretraining = layerwise_pretraining
-
-        self._input_bn = None
-        if cmvn:
-            self._input_bn = torch.nn.BatchNorm1d(self.input_size)
-
-        self._decoder = ctc_beam_search_decoder_batch
-        self._alphabet = Alphabet(os.path.join(
-            vocab_path, target_namespace + ".txt"))
-        self._beam_size = beam_size
-        self._num_processes = beam_size
-        self._wer = WordErrorRate()
-
-        sample_rate = 16000
-        self._sample_rate = sample_rate
-        win_length = int(sample_rate * 0.025)
-        hop_length = int(sample_rate * 0.01)
-        n_fft = win_length
         initializer(self)
 
     @overrides
     def forward(self,  # type: ignore
                 source_features: torch.FloatTensor,
                 source_lengths: torch.LongTensor,
-                target_tokens: Dict[str, torch.LongTensor] = None,
-                epoch_num=None) -> Dict[str, torch.Tensor]:
-        # pylint: disable=arguments-differ
+                target_tokens: Dict[str, torch.LongTensor] = None) -> Dict[str, torch.Tensor]:
+        logits = self._projection(self._dropout(source_features))
+        batch_size, src_out_len, _ = logits.size()
+        reshaped_logits = logits.view(-1, self._num_classes)
+        log_probs = F.log_softmax(reshaped_logits, dim=-1).view(batch_size,
+                                                                src_out_len,
+                                                                self._num_classes)
+        loss = self._get_loss(log_probs, target_tokens, source_lengths)
+        predictions = self._greedy_decode(log_probs, source_lengths)
+        self._wer(predictions, target_tokens[self._target_namespace])
+
+        output_dict: Dict[str, torch.FloatTensor] = {}
+        output_dict["predictions"] = predictions
+        output_dict["loss"] = loss
+        return output_dict
+
+    def _get_loss(self, log_probs: torch.FloatTensor, target_tokens: Dict[str, torch.LongTensor],
+                  source_lengths: torch.LongTensor) -> torch.FloatTensor:
+        targets = target_tokens[self._target_namespace]
+        mask = (targets != self._pad_index).bool()
+        if self._remove_sos and self._remove_eos:
+            targets, mask = remove_sentence_boundaries(targets, mask)
+        elif self._remove_sos:
+            targets = targets[:, 1:]
+            mask = mask[:, 1:]
+        else:
+            raise NotImplementedError
+
+        target_lengths = util.get_lengths_from_binary_sequence_mask(mask)
+        loss = self._loss(log_probs.transpose(1, 0),
+                          targets,
+                          source_lengths,
+                          target_lengths)
+        return loss
+
+    def _greedy_decode(self, log_probs: torch.Tensor,
+                       source_lengths: torch.LongTensor) -> List[List[int]]:
+        _, raw_predictions = log_probs.max(dim=-1)
+        predictions = [[k for k, g in groupby(prediction[:length]) if k != self._pad_index]
+                       for prediction, length in
+                       zip(raw_predictions.tolist(), source_lengths.tolist())]
+        return predictions
+
+    @overrides
+    def get_metrics(self, reset: bool = False) -> Dict[str, float]:
+        all_metrics: Dict[str, float] = {}
+        if not self.training:
+            all_metrics.update(self._wer.get_metric(reset=reset))
+        return all_metrics
+
+@Model.register("rnnt")
+class RNNTLayer(Model):
+    def __init__(self, vocab: Vocabulary,
+                 input_size: int,
+                 hidden_size: int,
+                 loss_ratio: float = 1.0,
+                 recurrency: nn.LSTM = None,
+                 num_layers: int = None,
+                 remove_sos: bool = True,
+                 remove_eos: bool = False,
+                 target_embedder: Embedding = None,
+                 target_embedding_dim: int = None,
+                 target_namespace: str = "tokens",
+                 initializer: InitializerApplicator = InitializerApplicator(),
+                 regularizer: Optional[RegularizerApplicator] = None) -> None:
+        super(RNNTLayer, self).__init__(vocab, regularizer)
+        import warprnnt_pytorch
+        self.loss_ratio = loss_ratio
+        self._remove_sos = remove_sos
+        self._remove_eos = remove_eos
+        self._target_namespace = target_namespace
+        self._num_classes = self.vocab.get_vocab_size(target_namespace)
+        self._pad_index = self.vocab.get_token_index(
+            DEFAULT_PADDING_TOKEN, self._target_namespace)
+        self._start_index = self.vocab.get_token_index(
+            START_SYMBOL, self._target_namespace)
+        self._end_index = self.vocab.get_token_index(
+            END_SYMBOL, self._target_namespace)
+
+        self._loss = warprnnt_pytorch.RNNTLoss(blank=self._pad_index,
+                                               reduction='mean')
+        self._recurrency = recurrency or \
+            nn.LSTM(input_size=target_embedding_dim,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    batch_first=True)
+
+        self._target_embedder = target_embedder or Embedding(self._num_classes,
+                                                             target_embedding_dim)
+        self.w_enc = nn.Linear(input_size, hidden_size, bias=True)
+        self.w_dec = nn.Linear(input_size, hidden_size, bias=False)
+        self._proj = nn.Linear(hidden_size, self._num_classes)
+
+        self._wer = WER(exclude_indices={
+            self._pad_index, self._end_index, self._start_index})
+
+        initializer(self)
+
+    @overrides
+    def forward(self,  # type: ignore
+                source_features: torch.FloatTensor,
+                source_lengths: torch.LongTensor,
+                target_tokens: Dict[str, torch.LongTensor] = None) -> Dict[str, torch.Tensor]:
+        targets = target_tokens[self._target_namespace]
+        dec_outs, _ = self._recurrency(self._target_embedder(targets), None)
+        logits = self._joint(source_features, dec_outs)
+        log_probs = F.log_softmax(logits, dim=-1)
+        loss = self._get_loss(log_probs, target_tokens, source_lengths)
+        if not self.training:
+            predictions = self._greedy_decode(log_probs, source_lengths)
+            self._wer(predictions, target_tokens[self._target_namespace])
+
+        output_dict: Dict[str, torch.FloatTensor] = {}
+        output_dict["loss"] = loss
+        return output_dict
+
+    def _get_loss(self, log_probs: torch.FloatTensor, target_tokens: Dict[str, torch.LongTensor],
+                  source_lengths: torch.LongTensor) -> torch.FloatTensor:
+        targets = target_tokens[self._target_namespace]
+        mask = (targets != self._pad_index).bool()
+
+        relevant_mask = mask[:, 1:]
+        relevant_targets = targets[:, 1:]
+        target_lengths = util.get_lengths_from_binary_sequence_mask(relevant_mask)
+        loss = self._joint_ctc_loss(log_probs, relevant_targets.int(),
+                                    source_lengths.int(), target_lengths.int())
+        return loss
+
+    def _joint(self, eouts, douts, non_linear=torch.tanh):
+        """Combine encoder outputs and prediction network outputs.
+        Args:
+            eouts (FloatTensor): `[B, T, n_units]`
+            douts (FloatTensor): `[B, L, n_units]`
+        Returns:
+            out (FloatTensor): `[B, T, L, vocab]`
         """
+        # broadcast
+        eouts = eouts.unsqueeze(2)  # `[B, T, 1, n_units]`
+        douts = douts.unsqueeze(1)  # `[B, 1, L, n_units]`
+        out = non_linear(self.w_enc(eouts) + self.w_dec(douts))
+        out = self._proj(out)
+        return out
+
+    def _greedy_decode(self, eouts: torch.Tensor, elens: torch.Tensor,
+                       dlens: torch.Tensor = None):
+        """
+        Batch decoding for RNN Transducer.
+
         Parameters
         ----------
-        tokens : Dict[str, torch.LongTensor], required
-            The output of ``TextField.as_array()``, which should typically be passed directly to a
-            ``TextFieldEmbedder``. This output is a dictionary mapping keys to ``TokenIndexer``
-            tensors.  At its most basic, using a ``SingleIdTokenIndexer`` this is: ``{"tokens":
-            Tensor(batch_size, num_tokens)}``. This dictionary will have the same keys as were used
-            for the ``TokenIndexers`` when you created the ``TextField`` representing your
-            sequence.  The dictionary is designed to be passed directly to a ``TextFieldEmbedder``,
-            which knows how to combine different word representations into a single vector per
-            token in your input.
-        tags : torch.LongTensor, optional (default = None)
-            A torch tensor representing the sequence of integer gold class labels of shape
-            ``(batch_size, num_tokens)``.
-        metadata : ``List[Dict[str, Any]]``, optional, (default = None)
-            metadata containing the original words in the sentence to be tagged under a 'words' key.
+        eouts: ``torch.FloatTensor``
+           encoder outputs, of shape (batch_size, max_enc_len, hidden_dim).
+        elens : ``torch.LongTensor``
+           encoder output sequence lengths, of shape (batch_size).
+        dlens : ``torch.LongTensor``, optional (default = None)
+           largest possible target sequence lengths, of shape (batch_size).
+           default to have the same value as elens.
 
         Returns
         -------
-        An output dictionary consisting of:
-        logits : torch.FloatTensor
-            A tensor of shape ``(batch_size, num_tokens, tag_vocab_size)`` representing
-            unnormalised log probabilities of the tag classes.
-        class_probabilities : torch.FloatTensor
-            A tensor of shape ``(batch_size, num_tokens, tag_vocab_size)`` representing
-            a distribution of the tag classes per word.
-        loss : torch.FloatTensor, optional
-            A scalar loss to be optimised.
-
+        Dict[str, torch.Tensor]
         """
-        #source_features = self._mel_spectrogram(source_features)
-        target_mask = get_text_field_mask(target_tokens)
-        epoch_num = epoch_num[0]
-        output_layer_num = self.get_output_layer_num(epoch_num)
+        batch_size, max_enc_len, _ = eouts.size()
+        if dlens is None:
+            dlens = elens.new_full(elens.size(), max_enc_len)
+        # Initialize target predictions with the start index.
+        # shape: (batch_size,)
+        y = elens.new_zeros((batch_size, 1)).fill_(self._start_index)
+        dout, dstate = self._rnnt_recurrency(self._target_embedder(y), None)
+        # current source position t for each element in a batch.
+        cur_enc_indices = elens.new_zeros((batch_size,))
+        end_indices = elens
+        # decoding finished when each current source position equals to the
+        # end_indices.
+        finished = (cur_enc_indices == end_indices)
+        batch_indices = torch.arange(batch_size)
+        # total steps traversed in the latttices, including horizontal steps
+        # (blanks).
+        hyp_lens = elens.new_zeros((batch_size,))
+        hypotheses = []
+        is_pad = lambda y, shape, tensor: y.view(*shape) \
+            .expand_as(tensor) == self._pad_index
+        while not finished.all():
+            hyp_lens += (~finished).long()
+            # for finished batch elements with cur_enc_indices == end_indices,
+            # we clamped it to prevent IndexError.
+            clamped_indices = torch.min(cur_enc_indices, end_indices - 1)
+            out = self._joint(eouts[batch_indices, clamped_indices].unsqueeze(1), dout)
+            y = out.argmax(-1).squeeze(1)
+            hypotheses.append(y.squeeze(1))
+            maybe_dout, maybe_dstate = self._recurrency(self._target_embedder(y),
+                                                             dstate)
+            # state will not be updated for those who output blanks (horizontal
+            # steps).
+            dout = torch.where(is_pad(y, (-1, 1, 1), dout), dout, maybe_dout)
+            dstate = tuple(torch.where(is_pad(y, (1, -1, 1), dstate[i]), dstate[i], maybe_dstate[i])
+                           for i in range(len(maybe_dstate)))
+            cur_enc_indices = torch.min(end_indices,
+                                        cur_enc_indices + (y.view(-1) == self._pad_index).long())
+            finished = (cur_enc_indices == (end_indices)) | (y.view(-1) == self._end_index) | \
+                        (hyp_lens > (elens + dlens))
 
-        if self._input_bn is not None:
-            source_features = self._input_bn(
-                source_features.transpose(-2, -1)).transpose(-2, -1)
-
-        encoded_features, _, source_lengths = self.encoder(
-            source_features, source_lengths, output_layer_num)
-        # source_mask = get_mask_from_sequence_lengths(
-        #     source_lengths, torch.max(source_lengths))
-        # encoded_features = self.encoder(source_features, source_mask)
-        batch_size, src_out_len, _ = encoded_features.size()
-
-        logits = self.projection_layer(encoded_features)
-        if "ctc" in self._loss_type:
-            reshaped_logits = logits.view(-1, self.num_classes)
-            log_probs = F.log_softmax(reshaped_logits, dim=-1).view(batch_size,
-                                                                    src_out_len,
-                                                                    self.num_classes)
-
-        output_dict = {}
-        target_lengths = get_lengths_from_binary_sequence_mask(target_mask)
-        if target_tokens is not None:
-            if self._loss_type == "ctc":
-                inputs = log_probs
-            elif self._loss_type == "warp_ctc":
-                inputs = torch.exp(log_probs)
-            elif self._loss_type == "rnnt":
-                inputs = logits
-            else:
-                raise NotImplementedError
-
-            loss = self._loss(inputs.transpose(1, 0),
-                              target_tokens["tokens"],
-                              source_lengths,
-                              target_lengths)
-            output_dict["loss"] = loss
-            if not self.training:
-                predictions = log_probs.max(dim=-1)[1]
-                hypotheses = []
-                for prediction in predictions:
-                    prediction = [
-                        k for k, g in itertools.groupby(prediction.tolist())]
-                    hypothesis = [
-                        w for w in prediction if w != self._blank_idx]
-                    hypotheses.append(hypothesis)
-                self._wer(hypotheses, target_tokens["tokens"])
-
-        return output_dict
-
-    @overrides
-    def decode(self, output_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Does a simple position-wise argmax over each token, converts indices to string labels, and
-        adds a ``"tags"`` key to the dictionary with the result.
-        """
-        all_predictions = output_dict['class_probabilities']
-        all_predictions = all_predictions.cpu().data.numpy()
-        if all_predictions.ndim == 3:
-            predictions_list = [all_predictions[i]
-                                for i in range(all_predictions.shape[0])]
-        else:
-            predictions_list = [all_predictions]
-        all_tags = []
-        for predictions in predictions_list:
-            argmax_indices = numpy.argmax(predictions, axis=-1)
-            tags = [self.vocab.get_token_from_index(x, namespace="labels")
-                    for x in argmax_indices]
-            all_tags.append(tags)
-        output_dict['tags'] = all_tags
-        return output_dict
-
-    def get_output_layer_num(self, epoch_num):
-        output_layer_num = self.encoder.num_layers
-        if self._layerwise_pretraining is not None:
-            for epoch, layer_num in self._layerwise_pretraining:
-                if epoch_num < epoch:
-                    break
-                output_layer_num = layer_num
-        return output_layer_num
-
+        hypotheses = torch.stack(hypotheses, dim=-1)
+        hypotheses = [list(filter(lambda idx: idx != self._pad_index, hypothesis[:hyp_len]))
+                      for hypothesis, hyp_len in zip(hypotheses, hyp_lens)]
+        return hypotheses
     @overrides
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
         all_metrics: Dict[str, float] = {}

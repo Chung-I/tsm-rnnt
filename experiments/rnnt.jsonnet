@@ -76,7 +76,7 @@ local BASE_ITERATOR = {
   "batch_size" : BATCH_SIZE,
   "sorting_keys": [["source_features", "dimension_0"],
                     ["target_tokens", "num_tokens"]],
-  "max_instances_in_memory": 256 * BATCH_SIZE,
+  "max_instances_in_memory": 1024 * BATCH_SIZE,
   #"maximum_samples_per_batch": ["dimension_0", 36000],
   "track_epoch": true,
 };
@@ -182,9 +182,9 @@ local PTS_READER = {
 };
 
 {
-  "random_seed": 13370,
-  "numpy_seed": 1337,
-  "pytorch_seed": 133,
+  // "random_seed": 13370,
+  // "numpy_seed": 1337,
+  // "pytorch_seed": 133,
   // "dataset_reader": FISHER_READER,
   // "validation_dataset_reader": VALID_FISHER_READER,
   "dataset_reader": TSM_READER,
@@ -226,12 +226,9 @@ local PTS_READER = {
     "cmvn": 'none',
     "from_candidates": false,
     "sampling_strategy": if OCD then "sample" else "max",
-    #"loss_type": "rnnt",
     "max_decoding_ratio": 1.0,
-    "joint_ctc_ratio": 1.0,
     "dep_ratio": 0.0,
     "pos_ratio": 0.0,
-    "ctc_keep_eos": true,
     "time_mask_width": 0,
     "freq_mask_width": 0,
     "time_mask_max_ratio": 0.0,
@@ -248,20 +245,46 @@ local PTS_READER = {
     //   "wdrop": 0.0,
     //   "stack_rates": [2, 2],
     // },
-    "encoder": {
-      "type": "lstm",
-      "input_size": VGG_OUTPUT_SIZE,
-      "hidden_size": ENCODER_HIDDEN_SIZE,
-      "num_layers": 4,
-      "bidirectional": (DIRECTIONS == 2)
-    },
     // "encoder": {
-    //   "_pretrained": {
-    //     "archive_file": "runs/uni-ctc-1.0-2/model.tar.gz",
-    //     "module_path": "_encoder",
-    //     "freeze": false
-    //   }
+    //   "type": "lstm",
+    //   "input_size": VGG_OUTPUT_SIZE,
+    //   "hidden_size": ENCODER_HIDDEN_SIZE,
+    //   "num_layers": 4,
+    //   "bidirectional": (DIRECTIONS == 2)
     // },
+    "ctc_layer": {
+      "type": "ctc",
+      "target_namespace": TARGET_NAMESPACE,
+      "loss_ratio": 0.5      
+    },
+    "rnnt_layer": {
+      "type": "rnnt",
+      "input_size": ENCODER_OUTPUT_SIZE,
+      "hidden_size": DECODER_HIDDEN_SIZE,
+      "loss_ratio": 0.5,
+      "recurrency": {
+        "_pretrained": {
+          "archive_file": "runs/lm/model.tar.gz",
+          "module_path": "_contextualizer._module",
+          "freeze": false
+        }
+      },
+      "target_embedder": {
+        "_pretrained": {
+          "archive_file": "runs/lm/model.tar.gz",
+          "module_path": "_text_field_embedder.token_embedder_tokens",
+          "freeze": false
+        }
+      }
+    },
+
+    "encoder": {
+      "_pretrained": {
+        "archive_file": "runs/ctc/model.tar.gz",
+        "module_path": "_encoder",
+        "freeze": false
+      }
+    },
     // "encoder": {
     //   "type": "residual_bidirectional_lstm",
     //   "input_size": VGG_OUTPUT_SIZE,
@@ -271,20 +294,20 @@ local PTS_READER = {
     //   "use_residual": true
     // },
     "dec_layers": 1,
-    "cnn": {
-      "type": "cnn",
-      "num_layers": VGG_LAYERS,
-      "in_channel": 1,
-      "hidden_channel": OUT_CHANNEL,
-      "nonlinearity": "relu"
-    },
     // "cnn": {
-    //   "_pretrained": {
-    //     "archive_file": "runs/uni-ctc-1.0-2/model.tar.gz",
-    //     "module_path": "_cnn",
-    //     "freeze": false
-    //   }
+    //   "type": "cnn",
+    //   "num_layers": VGG_LAYERS,
+    //   "in_channel": 1,
+    //   "hidden_channel": OUT_CHANNEL,
+    //   "nonlinearity": "relu"
     // },
+    "cnn": {
+      "_pretrained": {
+        "archive_file": "runs/ctc/model.tar.gz",
+        "module_path": "_cnn",
+        "freeze": false
+      }
+    },
     "max_decoding_steps": 30,
     "target_embedding_dim": DECODER_HIDDEN_SIZE,
     "beam_size": 5,
@@ -304,19 +327,20 @@ local PTS_READER = {
       "values_dim": ENCODER_HIDDEN_SIZE,
       "num_heads" : 1
     },
-    "n_pretrain_ctc_epochs": 0,
     "target_namespace": TARGET_NAMESPACE,
     "phoneme_target_namespace": PHN_TARGET_NAMESPACE,
     "initializer": [
       [".*_cnn.*", "prevent"],
       [".*_encoder.*", "prevent"],
+      [".*_rnnt_recurrency.*", "prevent"],
       [".*linear.*weight", {"type": "xavier_uniform"}],
       [".*linear.*bias", {"type": "zero"}],
       [".*weight_ih.*", {"type": "xavier_uniform"}],
       [".*weight_hh.*", {"type": "orthogonal"}],
       [".*bias_ih.*", {"type": "zero"}],
       [".*bias_hh.*", {"type": "lstm_hidden_bias"}],
-      ["_target_embedder.weight", {"type": "uniform", "a": -1, "b": 1}],
+      #["_target_embedder.weight", {"type": "uniform", "a": -1, "b": 1}],
+      ["_target_embedder.weight", "prevent"],
     ]
   },
   "iterator": BASE_ITERATOR + {"instances_per_epoch": 1280000},
@@ -333,7 +357,7 @@ local PTS_READER = {
     "patience": 20,
     "grad_norm": 2.0,
     "cuda_device": 0,
-    "validation_metric": "+BLEU",
+    "validation_metric": "-ctc_wer",
     "num_serialized_models_to_keep": 1,
     "should_log_learning_rate": true,
     // "learning_rate_scheduler": {
@@ -347,10 +371,13 @@ local PTS_READER = {
     //   "milestones": [54, 68, 84],
     //   "gamma": 0.5,
     // },
-    "learning_rate_scheduler": {
-      "type": "multi_step",
-      "milestones": [60, 72, 84],
-      "gamma": 0.5,
+    // "learning_rate_scheduler": {
+    //   "type": "multi_step",
+    //   "milestones": [60, 72, 84],
+    //   "gamma": 0.5,
+    // },
+    "optimizer": {
+      "type": "dense_sparse_adam"
     },
     // "optimizer": {
     //   "type": "adamw",
@@ -358,11 +385,16 @@ local PTS_READER = {
     //   "amsgrad": true,
     //   "weight_decay": 1e-6
     // }
-    "optimizer": {
-      "type": "adadelta",
-      "lr": 1.0,
-      "eps": 1e-8
+    "learning_rate_scheduler": {
+      "type": "noam",
+      "model_size": 512,
+      "warmup_steps": 6000
     },
+    // "optimizer": {
+    //   "type": "adadelta",
+    //   "lr": 1.0,
+    //   "eps": 1e-8
+    // },
     "summary_interval": SUMMARY_INTERVAL
   }
 }
