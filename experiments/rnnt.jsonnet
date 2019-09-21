@@ -257,10 +257,18 @@ local PTS_READER = {
       "target_namespace": TARGET_NAMESPACE,
       "loss_ratio": 0.5      
     },
+    "projection_layer": {
+      "_pretrained": {
+        "archive_file": "runs/ctc/model.tar.gz",
+        "module_path": "_joint_ctc_projection_layer",
+        "freeze": false
+      }
+    },
     "rnnt_layer": {
       "type": "rnnt",
       "input_size": ENCODER_OUTPUT_SIZE,
       "hidden_size": DECODER_HIDDEN_SIZE,
+      "target_namespace": TARGET_NAMESPACE,
       "loss_ratio": 0.5,
       "recurrency": {
         "_pretrained": {
@@ -277,7 +285,6 @@ local PTS_READER = {
         }
       }
     },
-
     "encoder": {
       "_pretrained": {
         "archive_file": "runs/ctc/model.tar.gz",
@@ -330,9 +337,10 @@ local PTS_READER = {
     "target_namespace": TARGET_NAMESPACE,
     "phoneme_target_namespace": PHN_TARGET_NAMESPACE,
     "initializer": [
+      [".*_projection_layer.*", "prevent"],
       [".*_cnn.*", "prevent"],
       [".*_encoder.*", "prevent"],
-      [".*_rnnt_recurrency.*", "prevent"],
+      [".*_recurrency.*", "prevent"],
       [".*linear.*weight", {"type": "xavier_uniform"}],
       [".*linear.*bias", {"type": "zero"}],
       [".*weight_ih.*", {"type": "xavier_uniform"}],
@@ -357,7 +365,7 @@ local PTS_READER = {
     "patience": 20,
     "grad_norm": 2.0,
     "cuda_device": 0,
-    "validation_metric": "-ctc_wer",
+    "validation_metric": "-rnnt_wer",
     "num_serialized_models_to_keep": 1,
     "should_log_learning_rate": true,
     // "learning_rate_scheduler": {
@@ -376,20 +384,20 @@ local PTS_READER = {
     //   "milestones": [60, 72, 84],
     //   "gamma": 0.5,
     // },
-    "optimizer": {
-      "type": "dense_sparse_adam"
-    },
     // "optimizer": {
-    //   "type": "adamw",
-    //   "lr": 0.0003,
-    //   "amsgrad": true,
-    //   "weight_decay": 1e-6
-    // }
-    "learning_rate_scheduler": {
-      "type": "noam",
-      "model_size": 512,
-      "warmup_steps": 6000
+    //   "type": "dense_sparse_adam"
+    // },
+    "optimizer": {
+      "type": "adamw",
+      "lr": 5e-5,
+      "amsgrad": true,
+      #"weight_decay": 1e-6
     },
+    // "learning_rate_scheduler": {
+    //   "type": "noam",
+    //   "model_size": 512,
+    //   "warmup_steps": 6000
+    // },
     // "optimizer": {
     //   "type": "adadelta",
     //   "lr": 1.0,

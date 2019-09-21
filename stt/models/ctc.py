@@ -82,10 +82,9 @@ class CTCLayer(Model):
 
     @overrides
     def forward(self,  # type: ignore
-                source_features: torch.FloatTensor,
+                logits: torch.FloatTensor,
                 source_lengths: torch.LongTensor,
                 target_tokens: Dict[str, torch.LongTensor] = None) -> Dict[str, torch.Tensor]:
-        logits = self._projection(self._dropout(source_features))
         batch_size, src_out_len, _ = logits.size()
         reshaped_logits = logits.view(-1, self._num_classes)
         log_probs = F.log_softmax(reshaped_logits, dim=-1).view(batch_size,
@@ -117,6 +116,7 @@ class CTCLayer(Model):
                           targets,
                           source_lengths,
                           target_lengths)
+
         return loss
 
     def _greedy_decode(self, log_probs: torch.Tensor,
@@ -130,8 +130,7 @@ class CTCLayer(Model):
     @overrides
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
         all_metrics: Dict[str, float] = {}
-        if not self.training:
-            all_metrics.update(self._wer.get_metric(reset=reset))
+        all_metrics["wer"] = self._wer.get_metric(reset=reset)
         return all_metrics
 
 @Model.register("rnnt")
@@ -175,12 +174,15 @@ class RNNTLayer(Model):
                                                              target_embedding_dim)
         self.w_enc = nn.Linear(input_size, hidden_size, bias=True)
         self.w_dec = nn.Linear(input_size, hidden_size, bias=False)
-        self._proj = nn.Linear(hidden_size, self._num_classes)
+        self._proj = None
 
         self._wer = WER(exclude_indices={
             self._pad_index, self._end_index, self._start_index})
 
         initializer(self)
+
+    def set_projection_layer(self, projection_layer: nn.Module) -> None:
+        self._proj = projection_layer
 
     @overrides
     def forward(self,  # type: ignore
@@ -191,9 +193,9 @@ class RNNTLayer(Model):
         dec_outs, _ = self._recurrency(self._target_embedder(targets), None)
         logits = self._joint(source_features, dec_outs)
         log_probs = F.log_softmax(logits, dim=-1)
-        loss = self._get_loss(log_probs, target_tokens, source_lengths)
+        loss = self._get_loss(log_probs, target_tokens, source_lengths)[0]
         if not self.training:
-            predictions = self._greedy_decode(log_probs, source_lengths)
+            predictions = self._greedy_decode(source_features, source_lengths)
             self._wer(predictions, target_tokens[self._target_namespace])
 
         output_dict: Dict[str, torch.FloatTensor] = {}
@@ -208,8 +210,8 @@ class RNNTLayer(Model):
         relevant_mask = mask[:, 1:]
         relevant_targets = targets[:, 1:]
         target_lengths = util.get_lengths_from_binary_sequence_mask(relevant_mask)
-        loss = self._joint_ctc_loss(log_probs, relevant_targets.int(),
-                                    source_lengths.int(), target_lengths.int())
+        loss = self._loss(log_probs, relevant_targets.int(),
+                          source_lengths.int(), target_lengths.int())
         return loss
 
     def _joint(self, eouts, douts, non_linear=torch.tanh):
@@ -252,7 +254,7 @@ class RNNTLayer(Model):
         # Initialize target predictions with the start index.
         # shape: (batch_size,)
         y = elens.new_zeros((batch_size, 1)).fill_(self._start_index)
-        dout, dstate = self._rnnt_recurrency(self._target_embedder(y), None)
+        dout, dstate = self._recurrency(self._target_embedder(y), None)
         # current source position t for each element in a batch.
         cur_enc_indices = elens.new_zeros((batch_size,))
         end_indices = elens
@@ -290,9 +292,9 @@ class RNNTLayer(Model):
         hypotheses = [list(filter(lambda idx: idx != self._pad_index, hypothesis[:hyp_len]))
                       for hypothesis, hyp_len in zip(hypotheses, hyp_lens)]
         return hypotheses
+
     @overrides
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
         all_metrics: Dict[str, float] = {}
-        if not self.training:
-            all_metrics.update(self._wer.get_metric(reset=reset))
+        all_metrics["wer"] = self._wer.get_metric(reset=reset)
         return all_metrics

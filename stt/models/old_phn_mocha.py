@@ -1,19 +1,20 @@
-from typing import Dict, List, Tuple, Any, Union
+from typing import Dict, List, Tuple, Any
 from itertools import groupby
 
+import numpy
 from overrides import overrides
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.linear import Linear
+from torch.nn.modules.rnn import LSTMCell
 import warprnnt_pytorch
 
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import START_SYMBOL, END_SYMBOL, sanitize
 from allennlp.data.vocabulary import Vocabulary
 from allennlp.modules.attention import LegacyAttention
-from allennlp.modules.text_field_embedders import TextFieldEmbedder
 from allennlp.modules import Attention, Seq2SeqEncoder
 from allennlp.modules.seq2seq_encoders.pytorch_seq2seq_wrapper import PytorchSeq2SeqWrapper
 from allennlp.modules.similarity_functions import SimilarityFunction
@@ -21,7 +22,7 @@ from allennlp.models.model import Model
 from allennlp.modules.token_embedders import Embedding
 from allennlp.nn import util
 from allennlp.nn.beam_search import BeamSearch
-from allennlp.training.metrics import Average, Metric
+from allennlp.training.metrics import UnigramRecall, Average
 from allennlp.nn import InitializerApplicator
 
 from stt.models.awd_rnn import AWDRNN
@@ -31,13 +32,12 @@ from stt.modules.losses import OCDLoss, EDOCDLoss, maybe_sample_from_candidates
 from stt.modules.losses import target_to_candidates
 from stt.models.util import averaging_tensor_of_same_label, remove_sentence_boundaries, char_to_word
 from stt.models.util import remove_eos as _remove_eos
-from stt.models.ctc import CTCLayer, RNNTLayer
 from stt.modules.attention import MonotonicAttention, differentiable_average_lagging
 from stt.modules.stateful_attention import StatefulAttention
 from stt.modules.specaugment import TimeMask, FreqMask
 from stt.modules.audio import Delta
 
-@Model.register("phn_mocha")
+@Model.register("old_phn_mocha")
 class PhnMoChA(Model):
     """
     This ``SimpleSeq2Seq`` class is a :class:`Model` which takes a sequence, encodes it, and then
@@ -101,17 +101,15 @@ class PhnMoChA(Model):
                  time_mask_width: int = 0,
                  freq_mask_width: int = 0,
                  time_mask_max_ratio: float = 0.0,
+                 rnnt_dim: int = 512,
                  dec_layers: int = 1,
                  layerwise_pretraining: List[Tuple[int, int]] = None,
                  cnn: Seq2SeqEncoder = None,
                  train_at_phn_level: bool = False,
-                 rnnt_layer: Model = None,
-                 phn_ctc_layer: Model = None,
-                 ctc_layer: Model = None,
-                 projection_layer: nn.Module = None,
-                 att_ratio: float = 0.0,
+                 joint_ctc_ratio: float = 0.0,
                  dep_ratio: float = 0.0,
                  pos_ratio: float = 0.0,
+                 ctc_keep_eos: bool = False,
                  attention: Attention = None,
                  attention_function: SimilarityFunction = None,
                  latency_penalty: float = 0.0,
@@ -119,6 +117,7 @@ class PhnMoChA(Model):
                  beam_size: int = 1,
                  target_namespace: str = "tokens",
                  phoneme_target_namespace: str = "phonemes",
+                 n_pretrain_ctc_epochs: int = 10,
                  dropout: float = 0.0,
                  sampling_strategy: str = "max",
                  from_candidates: bool = False,
@@ -134,15 +133,7 @@ class PhnMoChA(Model):
 
         self._dep_parser = dep_parser
         self._pos_tagger = pos_tagger
-        self._ctc_layer = ctc_layer
-        self._rnnt_layer = rnnt_layer
-        self._phn_ctc_layer = phn_ctc_layer
-        self._projection_layer = projection_layer
-        self._rnnt_layer.set_projection_layer(projection_layer)
-        self._att_ratio = att_ratio
-        self._dep_ratio = dep_ratio
-        self._pos_ratio = pos_ratio
-        self._loss_type = loss_type
+
         # We need the start symbol to provide as the input at the first timestep of decoding, and
         # end symbol as a way to indicate the end of the decoded sequence.
         self._start_index = self.vocab.get_token_index(
@@ -155,15 +146,19 @@ class PhnMoChA(Model):
         self._phn_pad_index = self.vocab.get_token_index(
             self.vocab._padding_token, self._phn_target_namespace)  # pylint: disable=protected-access
 
-        exclude_indices = {self._pad_index, self._end_index, self._start_index}
-
-        self._logs: Dict[str, Union[Metric, None]] = {
-            "att_wer": (WER(exclude_indices=exclude_indices) if self._att_ratio > 0 else None),
-            "att_bleu": (BLEU(exclude_indices=exclude_indices) if self._att_ratio > 0 else None),
-            "att_loss": (Average() if self._att_ratio > 0 else None),
-            "phn_ctc_loss": (Average() if self._phn_ctc_layer else None),
-            "ctc_loss": (Average() if self._ctc_layer else None),
-            "rnnt_loss": (Average() if self._rnnt_layer else None),
+        self._bleu = BLEU(
+            exclude_indices={self._pad_index, self._end_index, self._start_index})
+        self._wer = WER(exclude_indices={
+            self._pad_index, self._end_index, self._start_index})
+        self._ctc_wer = WER(exclude_indices={
+            self._pad_index, self._end_index, self._start_index})
+        self._phn_wer = WER(exclude_indices={
+            self._phn_pad_index})
+        self._unigram_recall = UnigramRecall()
+        self._logs = {
+            "phn_ctc_loss": Average(),
+            "joint_ctc_loss": Average(),
+            "att_loss": Average(),
             "dal_loss": (Average() if latency_penalty > 0.0 else None),
             "dep_loss": (Average() if self._dep_parser else None),
             "pos_loss": (Average() if self._pos_tagger else None),
@@ -225,6 +220,35 @@ class PhnMoChA(Model):
         # TODO (pradeep): Do not hardcode decoder cell type.
         self._decoder = nn.LSTM(self._decoder_input_dim, self._decoder_output_dim,
                                 num_layers=self._dec_layers, batch_first=True)
+
+        self._num_phn_classes = self.vocab.get_vocab_size(self._phn_target_namespace)
+        self._ctc_projection_layer = nn.Linear(self._encoder_output_dim, self._num_phn_classes)
+        self._ctc_loss = nn.CTCLoss(blank=self._phn_pad_index)
+        self._n_pretrain_ctc_epochs = n_pretrain_ctc_epochs
+        self._ctc_proj_drop = nn.Dropout(p=dropout)
+
+        self._dep_ratio = dep_ratio
+        self._pos_ratio = pos_ratio
+        self._joint_ctc_ratio = joint_ctc_ratio
+        self._loss_type = loss_type
+        if self._joint_ctc_ratio > 0.0:
+            self._joint_ctc_projection_layer = nn.Linear(self._encoder_output_dim,
+                                                         self._num_classes)
+            if  loss_type == 'rnnt':
+                self._joint_ctc_loss = warprnnt_pytorch.RNNTLoss(blank=self._pad_index,
+                                                                 reduction='mean')
+
+                self._rnnt_recurrency = nn.LSTM(input_size=target_embedding_dim,
+                                                hidden_size=self._encoder_output_dim,
+                                                num_layers=self._dec_layers,
+                                                batch_first=True)
+                self.w_enc = Linear(self._encoder_output_dim, rnnt_dim, bias=True)
+                self.w_dec = Linear(self._encoder_output_dim, rnnt_dim, bias=False)
+                self._rnnt_proj = nn.Linear(rnnt_dim, self._num_classes)
+            else:
+                self._joint_ctc_loss = nn.CTCLoss(blank=self._pad_index)
+            self._joint_ctc_proj_drop = nn.Dropout(p=dropout)
+        self._ctc_keep_eos = ctc_keep_eos
 
         # We project the hidden state from the decoder into the output vocabulary space
         # in order to get log probabilities of each target token, at each time step.
@@ -318,6 +342,184 @@ class PhnMoChA(Model):
 
         return class_log_probabilities, state
 
+    def _rnnt_joint(self, eouts, douts, non_linear=torch.tanh):
+        """Combine encoder outputs and prediction network outputs.
+        Args:
+            eouts (FloatTensor): `[B, T, n_units]`
+            douts (FloatTensor): `[B, L, n_units]`
+        Returns:
+            out (FloatTensor): `[B, T, L, vocab]`
+        """
+        # broadcast
+        eouts = eouts.unsqueeze(2)  # `[B, T, 1, n_units]`
+        douts = douts.unsqueeze(1)  # `[B, 1, L, n_units]`
+        out = non_linear(self.w_enc(eouts) + self.w_dec(douts))
+        out = self._rnnt_proj(out)
+        return out
+
+    def _get_ctc_output(self, projection: nn.Module,
+                        dropout: nn.Module,
+                        num_classes: int,
+                        state: Dict[str, torch.Tensor]) -> torch.Tensor:
+
+        logits = projection(dropout(state["encoder_outputs"]))
+        batch_size, src_out_len, _ = logits.size()
+        reshaped_logits = logits.view(-1, num_classes)
+        ctc_log_probs = F.log_softmax(reshaped_logits, dim=-1).view(batch_size,
+                                                                    src_out_len,
+                                                                    num_classes)
+        return ctc_log_probs
+
+    def _get_ctc_loss(self, loss_func: nn.Module,
+                      log_probs: torch.Tensor,
+                      source_lengths: torch.Tensor,
+                      targets: Dict[str, torch.Tensor],
+                      remove_sos: bool = False,
+                      remove_eos: bool = False,
+                      pad_index=0) -> torch.Tensor:
+
+        mask = (targets != pad_index).bool()
+        if remove_sos and remove_eos:
+            targets, mask = remove_sentence_boundaries(targets, mask)
+        elif remove_sos:
+            targets = targets[:, 1:]
+            mask = mask[:, 1:]
+        else:
+            raise NotImplementedError
+
+        target_lengths = util.get_lengths_from_binary_sequence_mask(mask)
+        ctc_loss = loss_func(log_probs.transpose(1, 0),
+                             targets,
+                             source_lengths,
+                             target_lengths)
+        return ctc_loss
+
+    def _ctc_greedy_decode(self, ctc_log_probs: torch.Tensor,
+                           source_lengths: torch.LongTensor,
+                           pad_index: int) -> List[List[int]]:
+        _, raw_predictions = ctc_log_probs.max(dim=-1)
+        predictions = [[k for k, g in groupby(prediction[:length]) if k != pad_index]
+                       for prediction, length in
+                       zip(raw_predictions.tolist(), source_lengths.tolist())]
+        return predictions
+    def _rnnt_greedy_decode(self, eouts, elens,
+                            exclude_eos=False, oracle=False,
+                            refs_id=None):
+        """Greedy decoding in the inference stage.
+        Args:
+            eouts (FloatTensor): `[B, T, enc_units]`
+            elens (IntTensor): `[B]`
+            max_len_ratio (int): maximum sequence length of tokens
+            idx2token (): converter from index to token
+            exclude_eos (bool): exclude <eos> from hypothesis
+            oracle (bool): teacher-forcing mode
+            refs_id (list): reference list
+            utt_ids (list): utterance id list
+            speakers (list): speaker list
+        Returns:
+            hyps (list): A list of length `[B]`, which contains arrays of size `[L]`
+            aw: dummy
+        """
+        bs = eouts.size(0)
+
+        hyps = []
+        for b in range(bs):
+            best_hyp_b = []
+            # Initialization
+            y = elens.new_zeros((1,1)).fill_(self._start_index)
+            dout, dstate = self._rnnt_recurrency(self._target_embedder(y), None)
+
+            t = 0
+            while t < elens[b]:
+                # Pick up 1-best per frame
+                out = self._rnnt_joint(eouts[b:b + 1, t:t + 1], dout)
+                y = out.squeeze(2).argmax(-1)
+                idx = y[0].item()
+
+                # Update prediction network only when predicting non-blank labels
+                if idx != self._pad_index:
+                    # early stop
+                    if idx == self._end_index:
+                        if not exclude_eos:
+                            best_hyp_b += [idx]
+                        break
+
+                    best_hyp_b += [idx]
+                    if oracle:
+                        raise NotImplementedError
+                        y = eouts.new_zeros(1, 1).fill_(refs_id[b, len(best_hyp_b) - 1])
+                    dout, dstate = self._rnnt_recurrency(self._target_embedder(y), dstate)
+                else:
+                    t += 1
+
+            hyps += [best_hyp_b]
+
+        return hyps
+
+    def my_rnnt_greedy_decode(self, eouts: torch.Tensor, elens: torch.Tensor,
+                              dlens: torch.Tensor = None):
+        """
+        Batch decoding for RNN Transducer.
+
+        Parameters
+        ----------
+        eouts: ``torch.FloatTensor``
+           encoder outputs, of shape (batch_size, max_enc_len, hidden_dim).
+        elens : ``torch.LongTensor``
+           encoder output sequence lengths, of shape (batch_size).
+        dlens : ``torch.LongTensor``, optional (default = None)
+           largest possible target sequence lengths, of shape (batch_size).
+           default to have the same value as elens.
+
+        Returns
+        -------
+        Dict[str, torch.Tensor]
+        """
+        bs, max_enc_len, _ = eouts.size()
+        if dlens is None:
+            dlens = elens.new_full(elens.size(), max_enc_len)
+        # Initialize target predictions with the start index.
+        # shape: (batch_size,)
+        y = elens.new_zeros((bs,1)).fill_(self._start_index)
+        dout, dstate = self._rnnt_recurrency(self._target_embedder(y), None)
+        # current source position t for each element in a batch.
+        cur_enc_indices = elens.new_zeros((bs,))
+        end_indices = elens
+        # decoding finished when each current source position equals to the
+        # end_indices.
+        finished = (cur_enc_indices == end_indices)
+        batch_indices = torch.arange(bs)
+        # total steps traversed in the latttices, including horizontal steps
+        # (blanks).
+        hyp_lens = elens.new_zeros((bs,))
+        hypotheses = []
+        is_pad = lambda y, shape, tensor: y.view(*shape) \
+            .expand_as(tensor) == self._pad_index
+        while not finished.all():
+            hyp_lens += (~finished).long()
+            # for finished batch elements with cur_enc_indices == end_indices,
+            # we clamped it to prevent IndexError.
+            clamped_indices = torch.min(cur_enc_indices, end_indices - 1)
+            out = self._rnnt_joint(eouts[batch_indices, clamped_indices].unsqueeze(1), dout)
+            y = out.argmax(-1).squeeze(1)
+            hypotheses.append(y.squeeze(1))
+            maybe_dout, maybe_dstate = self._rnnt_recurrency(self._target_embedder(y),
+                                                             dstate)
+            # state will not be updated for those who output blanks (horizontal
+            # steps).
+            dout = torch.where(is_pad(y, (-1, 1, 1), dout), dout, maybe_dout)
+            dstate = tuple(torch.where(is_pad(y, (1, -1, 1), dstate[i]), dstate[i], maybe_dstate[i])
+                           for i in range(len(maybe_dstate)))
+            cur_enc_indices = torch.min(end_indices,
+                                        cur_enc_indices + (y.view(-1) == self._pad_index).long())
+            finished = (cur_enc_indices == (end_indices)) | (y.view(-1) == self._end_index) | \
+                        (hyp_lens > (elens + dlens))
+
+        hypotheses = torch.stack(hypotheses, dim=-1)
+        hypotheses = [list(filter(lambda idx: idx != self._pad_index, hypothesis[:hyp_len]))
+                      for hypothesis, hyp_len in zip(hypotheses, hyp_lens)]
+        return hypotheses
+
     @overrides
     def forward(self,  # type: ignore
                 source_features: torch.FloatTensor,
@@ -369,36 +571,67 @@ class PhnMoChA(Model):
         source_lengths = util.get_lengths_from_binary_sequence_mask(state["source_mask"])
         target_tokens["mask"] = (target_tokens[self._target_namespace] != self._pad_index).bool()
 
-        if self._phn_ctc_layer and \
-            (self._phn_target_namespace in self._target_granularity or self._train_at_phn_level):
-            raise NotImplementedError
-            # logits = self._projection_layer(state["encoder_outputs"])
-            # phn_ctc_output_dict = self._phn_ctc_layer(logits, source_lengths, target_tokens)
-            # output_dict.update({f"phn_ctc_{key}": value for key, value in phn_ctc_output_dict.items()})
+        if self._phn_target_namespace in self._target_granularity or self._train_at_phn_level:
+            targets = target_tokens[self._phn_target_namespace]
+            ctc_log_probs = self._get_ctc_output(self._ctc_projection_layer,
+                                                 self._ctc_proj_drop,
+                                                 self._num_phn_classes,
+                                                 state)
+            ctc_loss = self._get_ctc_loss(self._ctc_loss, ctc_log_probs,
+                                          source_lengths, targets,
+                                          pad_index=self._phn_pad_index)
+            output_dict["phn_ctc_loss"] = ctc_loss
+            if not self._train_at_phn_level:
+                predictions = self._ctc_greedy_decode(ctc_log_probs, source_lengths,
+                                                      self._phn_pad_index)
+                self._phn_wer(predictions, targets)
 
-        if self._rnnt_layer is not None:
-            rnnt_output_dict = self._rnnt_layer(state["encoder_outputs"], source_lengths, target_tokens)
-            output_dict.update({f"rnnt_{key}": value for key, value in rnnt_output_dict.items()})
-        if self._ctc_layer is not None:
-            logits = self._projection_layer(state["encoder_outputs"])
-            ctc_output_dict = self._ctc_layer(logits, source_lengths, target_tokens)
-            output_dict.update({f"ctc_{key}": value for key, value in ctc_output_dict.items()})
+        if self._joint_ctc_ratio > 0.0:
+            targets = target_tokens[self._target_namespace]
+            if self._loss_type == "rnnt":
+                rnnt_dec_outs, _ = self._rnnt_recurrency(self._target_embedder(targets), None)
+                rnnt_logits = self._rnnt_joint(state["encoder_outputs"], rnnt_dec_outs)
+                rnnt_log_probs = F.log_softmax(rnnt_logits, dim=-1)
+                target_mask = util.get_text_field_mask(target_tokens)
+                relevant_mask = target_mask[:, 1:]
+                relevant_targets = targets[:, 1:]
+                target_lengths = util.get_lengths_from_binary_sequence_mask(relevant_mask)
+                joint_ctc_loss = self._joint_ctc_loss(rnnt_log_probs, relevant_targets.int(),
+                                                      source_lengths.int(), target_lengths.int())
+                # with torch.no_grad():
+                #     ctc_predictions = self.my_rnnt_greedy_decode(state["encoder_outputs"],
+                #                                                  source_lengths,
+                #                                                  target_lengths)
+            else:
+                joint_ctc_log_probs = self._get_ctc_output(self._joint_ctc_projection_layer,
+                                                           self._joint_ctc_proj_drop,
+                                                           self._num_classes,
+                                                           state)
+                joint_ctc_loss = self._get_ctc_loss(self._joint_ctc_loss, joint_ctc_log_probs,
+                                                    source_lengths, targets, remove_sos=True,
+                                                    remove_eos=(not self._ctc_keep_eos),
+                                                    pad_index=self._pad_index)
 
-        if target_tokens and self._att_ratio > 0.0 and \
+                ctc_predictions = self._ctc_greedy_decode(joint_ctc_log_probs,
+                                                          source_lengths,
+                                                          self._pad_index)
+                self._ctc_wer(ctc_predictions, targets)
+            output_dict["joint_ctc_loss"] = joint_ctc_loss
+
+        if target_tokens and self._joint_ctc_ratio < 1.0 and \
             self._target_granularity == self._target_namespace:
             targets = target_tokens[self._target_namespace]
             output_dict["target_tokens"] = targets
             target_mask = util.get_text_field_mask(target_tokens)
             if self._train_at_phn_level:
-                raise NotImplementedError
-                # state = self._get_phn_level_representations(
-                #     state["encoder_outputs"].detach().requires_grad_(True),
-                #     state["source_mask"],
-                #     output_dict["phn_ctc"])
+                state = self._get_phn_level_representations(
+                    state["encoder_outputs"].detach().requires_grad_(True),
+                    state["source_mask"],
+                    ctc_log_probs)
 
             state = self._init_decoder_state(state)
             output_dict.update(self._forward_loop(state, target_tokens))
-            self._logs["att_wer"](output_dict["predictions"], targets)
+            self._wer(output_dict["predictions"], targets)
 
             if self._dep_parser or self._pos_tagger:
                 relevant_mask = target_mask[:, 1:]
@@ -419,9 +652,11 @@ class PhnMoChA(Model):
                     tagger_outputs["pos_loss"] = tagger_outputs.pop("loss")
                     output_dict.update(tagger_outputs)
 
+        self._update_metrics(output_dict)
+
         if not self.training:
             if self._target_granularity == self._target_namespace:
-                if self._ctc_layer.loss_ratio < 1.0:
+                if self._joint_ctc_ratio < 1.0:
                     state = self._init_decoder_state(state)
                     predictions = self._forward_beam_search(state)
                     output_dict.update(predictions)
@@ -431,14 +666,35 @@ class PhnMoChA(Model):
                         top_k_predictions = output_dict["predictions"]
                         # shape: (batch_size, max_predicted_sequence_length)
                         best_predictions = top_k_predictions[:, 0, :]
-                        self._logs["att_bleu"](best_predictions, targets)
-                        self._logs["att_wer"](best_predictions, targets)
+                        self._bleu(best_predictions, targets)
+                        self._wer(best_predictions, targets)
+                        self._unigram_recall(top_k_predictions, targets,
+                                             target_mask.long())
+                if self._joint_ctc_ratio > 0.0:
+                    with torch.no_grad():
+                        if self._loss_type == 'rnnt':
+                            ctc_predictions = self.my_rnnt_greedy_decode(state["encoder_outputs"],
+                                                                        source_lengths)
+                        else:
+                            ctc_predictions = self._ctc_greedy_decode(joint_ctc_log_probs,
+                                                                    source_lengths,
+                                                                    self._pad_index)
+                    if target_tokens:
+                        self._ctc_wer(ctc_predictions, target_tokens[self._target_namespace])
+                    output_dict["ctc_predictions"] = ctc_predictions
+
+            elif self._phn_target_namespace in self._target_granularity:
+                predictions = self._ctc_greedy_decode(ctc_log_probs, source_lengths,
+                                                      self._phn_pad_index)
+                self._phn_wer(predictions, target_tokens[self._phn_target_namespace])
+            else:
+                raise NotImplementedError
 
         if self.training:
+            att_ratio = 1 - self._joint_ctc_ratio - self._dep_ratio - self._pos_ratio
             output_dict = self._collect_losses(output_dict,
-                                               ctc=self._ctc_layer.loss_ratio,
-                                               rnnt=self._rnnt_layer.loss_ratio,
-                                               att=self._att_ratio,
+                                               joint_ctc=self._joint_ctc_ratio,
+                                               att=att_ratio,
                                                dal=self._latency_penalty,
                                                dep=self._dep_ratio,
                                                pos=self._pos_ratio)
@@ -447,7 +703,6 @@ class PhnMoChA(Model):
                 for key, _ in output_dict.items():
                     if "loss" in key:
                         output_dict[key] = output_dict[key].new_zeros(size=(), requires_grad=True).clone()
-        self._update_metrics(output_dict)
 
         return output_dict
 
@@ -841,8 +1096,7 @@ class PhnMoChA(Model):
     def _collect_losses(self,
                         output_dict: Dict[str, torch.Tensor],
                         phn_ctc: float = 1.0,
-                        ctc: float = 1.0,
-                        rnnt: float = 1.0,
+                        joint_ctc: float = 1.0,
                         att: float = 1.0,
                         dep: float = 1.0,
                         pos: float = 1.0,
@@ -850,10 +1104,8 @@ class PhnMoChA(Model):
         loss = 0.0
         if "phn_ctc_loss" in output_dict:
             loss += phn_ctc * output_dict["phn_ctc_loss"]
-        if "ctc_loss" in output_dict:
-            loss += ctc * output_dict["ctc_loss"]
-        if "rnnt_loss" in output_dict:
-            loss += rnnt * output_dict["rnnt_loss"]
+        if "joint_ctc_loss" in output_dict:
+            loss += joint_ctc * output_dict["joint_ctc_loss"]
         if "att_loss" in output_dict:
             loss += att * output_dict["att_loss"]
         if "dep_loss" in output_dict:
@@ -879,25 +1131,25 @@ class PhnMoChA(Model):
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
 
         all_metrics: Dict[str, float] = {}
-        for key, metric_tracker in self._logs.items():
-            if "phn" in key and self._phn_target_namespace not in self._target_granularity:
-                continue
-            if "att" in key and self._target_namespace not in self._target_granularity:
-                continue
-            if metric_tracker is not None:
-                metric_values = metric_tracker.get_metric(reset=reset)
-                if isinstance(metric_values, dict):
-                    all_metrics.update(metric_values)
-                else:
-                    all_metrics[key] = metric_values
-        if self._ctc_layer:
-            all_metrics.update({f"ctc_{key}": value for key, value in
-                                self._ctc_layer.get_metrics(reset=reset).items()})
-        if self._rnnt_layer:
-            all_metrics.update({f"rnnt_{key}": value for key, value in
-                                self._rnnt_layer.get_metrics(reset=reset).items()})
+        if self._phn_target_namespace in self._target_granularity:
+            all_metrics["phn_ctc_loss"] = self._logs["phn_ctc_loss"].get_metric(reset=reset)
+            all_metrics["phn_wer"] = self._phn_wer.get_metric(reset=reset)
+        if self._target_granularity == self._target_namespace:
+            all_metrics["att_loss"] = self._logs["att_loss"].get_metric(reset=reset)
+            all_metrics["att_wer"] = self._wer.get_metric(reset=reset)
+        if self._joint_ctc_ratio > 0.0:
+            all_metrics["joint_ctc_loss"] = self._logs["joint_ctc_loss"].get_metric(reset=reset)
+            all_metrics["ctc_wer"] = self._ctc_wer.get_metric(reset=reset)
+        if self._logs["dal_loss"] is not None:
+            all_metrics["dal_loss"] = self._logs["dal_loss"].get_metric(reset=reset)
+        if self._logs["pos_loss"] is not None:
+            all_metrics["pos_loss"] = self._logs["pos_loss"].get_metric(reset=reset)
+        if self._logs["dep_loss"] is not None:
+            all_metrics["dep_loss"] = self._logs["dep_loss"].get_metric(reset=reset)
 
         if not self.training:
+            all_metrics.update(self._bleu.get_metric(reset=reset))
+            all_metrics["UR"] = self._unigram_recall.get_metric(reset=reset)
             if self._dep_parser:
                 all_metrics.update(self._dep_parser.get_metrics(reset=reset))
             if self._pos_tagger:
