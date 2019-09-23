@@ -24,8 +24,6 @@ def differentiable_average_lagging(mono_attns: torch.FloatTensor,
         A tensor of shape ``(batch_size, num_encoding_steps)``.
     """
     # shape (batch_size, num_encoding_steps)
-    import pdb
-    pdb.set_trace()
     step_values = source_mask * torch.cumsum(source_mask, dim=-1)
     source_lengths = get_lengths_from_binary_sequence_mask(source_mask)
     target_lengths = get_lengths_from_binary_sequence_mask(target_mask)

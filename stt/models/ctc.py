@@ -19,8 +19,9 @@ from allennlp.models.model import Model
 from allennlp.nn import InitializerApplicator, RegularizerApplicator
 from allennlp.nn import util
 from allennlp.modules.token_embedders import Embedding
+from allennlp.training.metrics import Average, Metric, BLEU
 
-from stt.models.util import remove_sentence_boundaries
+from stt.models.util import remove_sentence_boundaries, list_to_tensor
 from stt.training.word_error_rate import WordErrorRate as WER
 
 @Model.register("ctc")
@@ -75,8 +76,10 @@ class CTCLayer(Model):
             START_SYMBOL, self._target_namespace)
         self._end_index = self.vocab.get_token_index(
             END_SYMBOL, self._target_namespace)
-        self._wer = WER(exclude_indices={
-            self._pad_index, self._end_index, self._start_index})
+        exclude_indices = {self._pad_index, self._end_index, self._start_index}
+        self._wer: Metric = WER(exclude_indices=exclude_indices)
+        self._bleu: Metric = BLEU(exclude_indices=exclude_indices)
+        self._dal: Metric = Average()
 
         initializer(self)
 
@@ -92,7 +95,10 @@ class CTCLayer(Model):
                                                                 self._num_classes)
         loss = self._get_loss(log_probs, target_tokens, source_lengths)
         predictions = self._greedy_decode(log_probs, source_lengths)
-        self._wer(predictions, target_tokens[self._target_namespace])
+        relevant_targets = target_tokens[self._target_namespace][:, 1:]
+        self._wer(predictions, relevant_targets)
+        prediction_tensor = list_to_tensor(predictions, relevant_targets) 
+        self._bleu(prediction_tensor, relevant_targets)
 
         output_dict: Dict[str, torch.FloatTensor] = {}
         output_dict["predictions"] = predictions
@@ -131,6 +137,7 @@ class CTCLayer(Model):
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
         all_metrics: Dict[str, float] = {}
         all_metrics["wer"] = self._wer.get_metric(reset=reset)
+        all_metrics.update(self._bleu.get_metric(reset=reset))
         return all_metrics
 
 @Model.register("rnnt")
@@ -146,6 +153,7 @@ class RNNTLayer(Model):
                  target_embedder: Embedding = None,
                  target_embedding_dim: int = None,
                  target_namespace: str = "tokens",
+                 slow_decode: bool = False,
                  initializer: InitializerApplicator = InitializerApplicator(),
                  regularizer: Optional[RegularizerApplicator] = None) -> None:
         super(RNNTLayer, self).__init__(vocab, regularizer)
@@ -153,6 +161,7 @@ class RNNTLayer(Model):
         self.loss_ratio = loss_ratio
         self._remove_sos = remove_sos
         self._remove_eos = remove_eos
+        self._slow_decode = slow_decode
         self._target_namespace = target_namespace
         self._num_classes = self.vocab.get_vocab_size(target_namespace)
         self._pad_index = self.vocab.get_token_index(
@@ -174,10 +183,12 @@ class RNNTLayer(Model):
                                                              target_embedding_dim)
         self.w_enc = nn.Linear(input_size, hidden_size, bias=True)
         self.w_dec = nn.Linear(input_size, hidden_size, bias=False)
-        self._proj = None
+        self._proj = nn.Linear(hidden_size, self._num_classes)
 
-        self._wer = WER(exclude_indices={
-            self._pad_index, self._end_index, self._start_index})
+        exclude_indices = {self._pad_index, self._end_index, self._start_index}
+        self._wer: Metric = WER(exclude_indices=exclude_indices)
+        self._bleu: Metric = BLEU(exclude_indices=exclude_indices)
+        self._dal = Average()
 
         initializer(self)
 
@@ -189,6 +200,8 @@ class RNNTLayer(Model):
                 source_features: torch.FloatTensor,
                 source_lengths: torch.LongTensor,
                 target_tokens: Dict[str, torch.LongTensor] = None) -> Dict[str, torch.Tensor]:
+        output_dict: Dict[str, torch.FloatTensor] = {}
+
         targets = target_tokens[self._target_namespace]
         dec_outs, _ = self._recurrency(self._target_embedder(targets), None)
         logits = self._joint(source_features, dec_outs)
@@ -196,9 +209,12 @@ class RNNTLayer(Model):
         loss = self._get_loss(log_probs, target_tokens, source_lengths)[0]
         if not self.training:
             predictions = self._greedy_decode(source_features, source_lengths)
-            self._wer(predictions, target_tokens[self._target_namespace])
+            relevant_targets = targets[:, 1:]
+            self._wer(predictions, relevant_targets)
+            prediction_tensor = list_to_tensor(predictions, relevant_targets) 
+            self._bleu(prediction_tensor, relevant_targets)
+            output_dict["predictions"] = predictions
 
-        output_dict: Dict[str, torch.FloatTensor] = {}
         output_dict["loss"] = loss
         return output_dict
 
@@ -229,8 +245,62 @@ class RNNTLayer(Model):
         out = self._proj(out)
         return out
 
+    def _slow_greedy_decode(self, eouts, elens,
+                            exclude_eos=False, oracle=False,
+                            refs_id=None):
+        """Greedy decoding in the inference stage.
+        Args:
+            eouts (FloatTensor): `[B, T, enc_units]`
+            elens (IntTensor): `[B]`
+            max_len_ratio (int): maximum sequence length of tokens
+            idx2token (): converter from index to token
+            exclude_eos (bool): exclude <eos> from hypothesis
+            oracle (bool): teacher-forcing mode
+            refs_id (list): reference list
+            utt_ids (list): utterance id list
+            speakers (list): speaker list
+        Returns:
+            hyps (list): A list of length `[B]`, which contains arrays of size `[L]`
+            aw: dummy
+        """
+        bs = eouts.size(0)
+
+        hyps = []
+        for b in range(bs):
+            best_hyp_b = []
+            # Initialization
+            y = elens.new_zeros((1, 1)).fill_(self._start_index)
+            dout, dstate = self._recurrency(self._target_embedder(y), None)
+
+            t = 0
+            while t < elens[b]:
+                # Pick up 1-best per frame
+                out = self._joint(eouts[b:b + 1, t:t + 1], dout)
+                y = out.squeeze(2).argmax(-1)
+                idx = y[0].item()
+
+                # Update prediction network only when predicting non-blank labels
+                if idx != self._pad_index:
+                    # early stop
+                    if idx == self._end_index:
+                        if not exclude_eos:
+                            best_hyp_b += [idx]
+                        break
+
+                    best_hyp_b += [idx]
+                    if oracle:
+                        raise NotImplementedError
+                        y = eouts.new_zeros(1, 1).fill_(refs_id[b, len(best_hyp_b) - 1])
+                    dout, dstate = self._recurrency(self._target_embedder(y), dstate)
+                else:
+                    t += 1
+
+            hyps += [best_hyp_b]
+
+        return hyps
+
     def _greedy_decode(self, eouts: torch.Tensor, elens: torch.Tensor,
-                       dlens: torch.Tensor = None):
+                       dlens: torch.Tensor = None) -> List[List[int]]:
         """
         Batch decoding for RNN Transducer.
 
@@ -288,13 +358,14 @@ class RNNTLayer(Model):
             finished = (cur_enc_indices == (end_indices)) | (y.view(-1) == self._end_index) | \
                         (hyp_lens > (elens + dlens))
 
-        hypotheses = torch.stack(hypotheses, dim=-1)
+        raw_hypotheses = torch.stack(hypotheses, dim=-1)
         hypotheses = [list(filter(lambda idx: idx != self._pad_index, hypothesis[:hyp_len]))
-                      for hypothesis, hyp_len in zip(hypotheses, hyp_lens)]
+                      for hypothesis, hyp_len in zip(raw_hypotheses.tolist(), hyp_lens.tolist())]
         return hypotheses
 
     @overrides
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
         all_metrics: Dict[str, float] = {}
         all_metrics["wer"] = self._wer.get_metric(reset=reset)
+        all_metrics.update(self._bleu.get_metric(reset=reset))
         return all_metrics

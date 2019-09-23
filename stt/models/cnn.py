@@ -50,7 +50,10 @@ class LengthAwareWrapper(nn.Module):
                     1.
                 )
             ).long()
-        outputs = self.module.forward(inputs)
+        if getattr(self.module, 'forward', None):
+            outputs = self.module.forward(inputs)
+        else:
+            outputs = self.module(inputs)
         return (outputs, lengths)
 
 @Seq2SeqEncoder.register("vgg")

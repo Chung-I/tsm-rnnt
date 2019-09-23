@@ -21,12 +21,11 @@ from allennlp.models.model import Model
 from allennlp.modules.token_embedders import Embedding
 from allennlp.nn import util
 from allennlp.nn.beam_search import BeamSearch
-from allennlp.training.metrics import Average, Metric
+from allennlp.training.metrics import Average, Metric, BLEU
 from allennlp.nn import InitializerApplicator
 
 from stt.models.awd_rnn import AWDRNN
 from stt.training.word_error_rate import WordErrorRate as WER
-from stt.training.bleu import BLEU
 from stt.modules.losses import OCDLoss, EDOCDLoss, maybe_sample_from_candidates
 from stt.modules.losses import target_to_candidates
 from stt.models.util import averaging_tensor_of_same_label, remove_sentence_boundaries, char_to_word
@@ -109,6 +108,7 @@ class PhnMoChA(Model):
                  phn_ctc_layer: Model = None,
                  ctc_layer: Model = None,
                  projection_layer: nn.Module = None,
+                 tie_proj: bool = False,
                  att_ratio: float = 0.0,
                  dep_ratio: float = 0.0,
                  pos_ratio: float = 0.0,
@@ -138,7 +138,8 @@ class PhnMoChA(Model):
         self._rnnt_layer = rnnt_layer
         self._phn_ctc_layer = phn_ctc_layer
         self._projection_layer = projection_layer
-        self._rnnt_layer.set_projection_layer(projection_layer)
+        if tie_proj:
+            self._rnnt_layer.set_projection_layer(projection_layer)
         self._att_ratio = att_ratio
         self._dep_ratio = dep_ratio
         self._pos_ratio = pos_ratio
@@ -376,10 +377,10 @@ class PhnMoChA(Model):
             # phn_ctc_output_dict = self._phn_ctc_layer(logits, source_lengths, target_tokens)
             # output_dict.update({f"phn_ctc_{key}": value for key, value in phn_ctc_output_dict.items()})
 
-        if self._rnnt_layer is not None:
+        if self._rnnt_layer is not None and self._rnnt_layer.loss_ratio > 0.0:
             rnnt_output_dict = self._rnnt_layer(state["encoder_outputs"], source_lengths, target_tokens)
             output_dict.update({f"rnnt_{key}": value for key, value in rnnt_output_dict.items()})
-        if self._ctc_layer is not None:
+        if self._ctc_layer is not None and self._ctc_layer.loss_ratio > 0.0:
             logits = self._projection_layer(state["encoder_outputs"])
             ctc_output_dict = self._ctc_layer(logits, source_lengths, target_tokens)
             output_dict.update({f"ctc_{key}": value for key, value in ctc_output_dict.items()})
@@ -421,7 +422,7 @@ class PhnMoChA(Model):
 
         if not self.training:
             if self._target_granularity == self._target_namespace:
-                if self._ctc_layer.loss_ratio < 1.0:
+                if self._att_ratio > 0.0:
                     state = self._init_decoder_state(state)
                     predictions = self._forward_beam_search(state)
                     output_dict.update(predictions)
@@ -482,6 +483,8 @@ class PhnMoChA(Model):
 
         _decode_predictions("predictions", "predicted_tokens", beam=True)
         _decode_predictions("ctc_predictions", "ctc_predicted_tokens")
+        _decode_predictions("rnnt_predictions", "rnnt_predicted_tokens")
+        _decode_predictions("target_tokens", "targets")
 
         return output_dict
 

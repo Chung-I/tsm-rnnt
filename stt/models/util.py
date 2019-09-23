@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, List, Union
 
 import torch
 import torch.nn.functional as F
@@ -87,3 +87,13 @@ def char_to_word(tensor: torch.Tensor,
 
     new_tensor.masked_fill(is_nan_or_inf(new_tensor), value=0)
     return new_tensor, segment_lengths
+
+def list_to_tensor(list_of_tensors: List[Union[List[int], torch.Tensor]],
+                   placeholder: torch.Tensor) -> torch.Tensor:
+    batch_size = len(list_of_tensors)
+    max_len = max(list(map(len, list_of_tensors)))
+    new_tensor = placeholder.new_zeros((batch_size, max_len))
+    for b, tensor in enumerate(list_of_tensors):
+        for i, value in enumerate(tensor):
+            new_tensor[b, i] = value
+    return new_tensor

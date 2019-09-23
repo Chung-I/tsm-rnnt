@@ -20,7 +20,7 @@ from allennlp.models.model import Model
 from allennlp.modules.token_embedders import Embedding
 from allennlp.nn import util
 from allennlp.nn.beam_search import BeamSearch
-from allennlp.training.metrics import UnigramRecall
+from allennlp.training.metrics import UnigramRecall, BLEU
 from allennlp.nn import InitializerApplicator
 
 from stt.models.awd_rnn import AWDRNN
@@ -28,7 +28,6 @@ from stt.training.word_error_rate import WordErrorRate as WER
 from stt.modules.losses import OCDLoss, maybe_sample_from_candidates
 from stt.modules.losses import target_to_candidates
 from stt.modules.attention import MonotonicAttention
-from stt.training.bleu import BLEU
 
 
 @Model.register("mt_seq2seq_mocha")
