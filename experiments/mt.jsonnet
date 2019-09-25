@@ -1,10 +1,13 @@
-local BATCH_SIZE = 128;
-local EMBEDDING_DIM = 256;
+local BATCH_SIZE = 32;
+local EMBEDDING_DIM = 512;
 local ENCODER_HIDDEN_SIZE = 512;
 local DECODER_HIDDEN_SIZE = 512;
 local TARGET_NAMESPACE = "target_tokens";
 local NUM_THREADS = 8;
 local NUM_GPUS = 1;
+local DIRECTIONS = 1;
+local ENCODER_OUTPUT_SIZE = ENCODER_HIDDEN_SIZE * DIRECTIONS;
+
 
 local BASE_READER = {
   "type": "mt",
@@ -29,11 +32,13 @@ local BASE_READER = {
     }
   },
   "target_token_indexers": {
-    "tokens": {
+    [TARGET_NAMESPACE]: {
       "type": "single_id",
       "namespace": "target_tokens"
     }
   },
+  "source_max_len": 50,
+  "target_max_len": 50,
   "lazy": true
 };
 
@@ -43,7 +48,7 @@ local BASE_ITERATOR = {
   "batch_size": BATCH_SIZE,
   "sorting_keys": [["source_tokens", "num_tokens"],
                    ["target_tokens", "num_tokens"]],
-  "maximum_samples_per_batch": ["num_tokens", 16384],
+  "maximum_samples_per_batch": ["num_tokens", 8192],
   "track_epoch": true
 };
 
@@ -51,8 +56,8 @@ local BASE_ITERATOR = {
   "dataset_reader": {
     "type": "multiprocess",
     "base_reader": BASE_READER,
-    "num_workers": 3,
-    "output_queue_size": 1024 * 3 * NUM_GPUS
+    "num_workers": 1,
+    "output_queue_size": 1024 * 1 * NUM_GPUS
   },
   "train_data_path": "data/translation/tok-wps/train/*.de-en.en",
   "validation_data_path": "data/translation/tok-wps/validation/*.en",
@@ -61,7 +66,7 @@ local BASE_ITERATOR = {
     "directory_path": "data/translation/tok-wps/vocab"
   },
   "model": {
-    "type": "mt_seq2seq_mocha",
+    "type": "phn_mocha",
     "source_embedder": {
       "token_embedders": {
         "tokens": {
@@ -72,40 +77,58 @@ local BASE_ITERATOR = {
         },
       }
     },
+    // "encoder": {
+    //   "type": "lstm",
+    //   "input_size": EMBEDDING_DIM,
+    //   "hidden_size": ENCODER_HIDDEN_SIZE,
+    //   "num_layers": 4,
+    //   "bidirectional": (DIRECTIONS == 2)
+    // },
     "encoder": {
-      "type": "lstm",
+      "type": "residual_lstm",
       "input_size": EMBEDDING_DIM,
       "hidden_size": ENCODER_HIDDEN_SIZE,
-      "num_layers": 2
+      "num_layers": 4,
+      "layer_dropout_probability": 0.0,
+      "use_residual": true,
+      "bidirectional": (DIRECTIONS == 2)
     },
+    "dec_layers": 4,
+    "att_ratio": 1.0,
     "max_decoding_steps": 100,
-    "target_embedding_dim": EMBEDDING_DIM,
-    "decoder_hidden_dim": DECODER_HIDDEN_SIZE,
-    "target_namespace": "target_tokens",
+    "target_embedding_dim": DECODER_HIDDEN_SIZE,
+    "target_namespace": TARGET_NAMESPACE,
     "attention": {
-      "type": "bilinear",
-      "matrix_dim": ENCODER_HIDDEN_SIZE,
+      "type": "stateful",
       "vector_dim": DECODER_HIDDEN_SIZE,
+      "matrix_dim": ENCODER_OUTPUT_SIZE,
+      "attention_dim": ENCODER_HIDDEN_SIZE,
+      "values_dim": ENCODER_HIDDEN_SIZE,
+      "num_heads" : 1
     },
-    "splits": [1000, 10000],
+    #"splits": [1000, 10000],
     "beam_size": 10
   },
-  "iterator": {
-    "type": "multiprocess",
-    "base_iterator": BASE_ITERATOR,
-    "num_workers": NUM_THREADS,
-    "output_queue_size": 1024 * 3 * NUM_GPUS
-  },
+  "iterator": BASE_ITERATOR,
+  // "iterator": {
+  //   "type": "multiprocess",
+  //   "base_iterator": BASE_ITERATOR,
+  //   "num_workers": NUM_THREADS,
+  //   "output_queue_size": 1024 * 3 * NUM_GPUS
+  // },
   "trainer": {
+    "type": "ignore_nan",
     "num_epochs": 100,
     "patience": 10,
     "cuda_device": 0,
     "validation_metric": "+BLEU",
     "optimizer": {
-      "type": "adamw",
-      "lr": 0.0003,
-      "amsgrad": true,
-      "weight_decay": 0.01
-    }
+      "type": "dense_sparse_adam"
+    },
+    "learning_rate_scheduler": {
+      "type": "noam",
+      "model_size": 512,
+      "warmup_steps": 12000
+    },
   }
 }

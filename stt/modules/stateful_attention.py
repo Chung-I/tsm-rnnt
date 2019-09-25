@@ -42,6 +42,7 @@ class StatefulAttention(Attention):
                  num_heads: int = 1,
                  activation: Activation = None,
                  attention_dropout_prob: float = 0.0,
+                 output_value: bool = False,
                  normalize=True) -> None:
         super().__init__(normalize)
 
@@ -49,6 +50,7 @@ class StatefulAttention(Attention):
         self._attention_dim = attention_dim
         self._values_dim = values_dim
         self._output_dim = matrix_dim
+        self._output_value = output_value
 
         if attention_dim % num_heads != 0:
             raise ValueError(f"Key size ({attention_dim}) must be divisible by the number of "
@@ -108,11 +110,13 @@ class StatefulAttention(Attention):
             queries_per_head = self._view_as_heads(queries)
             scaled_similarities = torch.bmm(queries_per_head / self._scale,
                                             keys_per_head.transpose(1, 2))
-
-            attention = masked_softmax(scaled_similarities,
-                                       mask.repeat(1, self._num_heads) \
-                                        .view(batch_size * self._num_heads, enc_timesteps),
-                                       memory_efficient=True)
+            if self._normalize:
+                attention = masked_softmax(scaled_similarities,
+                                           mask.repeat(1, self._num_heads) \
+                                           .view(batch_size * self._num_heads, enc_timesteps),
+                                           memory_efficient=True)
+            else:
+                attention = scaled_similarities
 
             attention = self._attention_dropout(attention)
 
@@ -125,9 +129,12 @@ class StatefulAttention(Attention):
         else:
             scaled_similarities = torch.bmm(queries / self._scale,
                                             keys.transpose(1, 2))
-            attention = masked_softmax(scaled_similarities,
-                                       mask,
-                                       memory_efficient=True)
+            if self._normalize:
+                attention = masked_softmax(scaled_similarities,
+                                           mask,
+                                           memory_efficient=True)
+            else:
+                attention = scaled_similarities
 
             attention = self._attention_dropout(attention)
             outputs = weighted_sum(values, attention)
@@ -137,4 +144,7 @@ class StatefulAttention(Attention):
             outputs = outputs.squeeze(1)
             attention = attention.squeeze(1)
 
-        return outputs, attention
+        if self._output_value:
+            return outputs, attention, values
+        else:
+            return outputs, attention

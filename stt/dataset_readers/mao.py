@@ -122,7 +122,7 @@ def kaldi_get_datas(file_path: str, targets: List[Tuple[str]],
         utt_datas = []
         for utt_id in utt_ids:
             utt_datas.append(raw_src_datas[utt_id])
-        source_data = np.concatenate((utt_datas), axis=-1)
+        source_data = np.concatenate((utt_datas), axis=0)
         source_datas.append(source_data)
         target_datas.append(tgt_trns[0])
 

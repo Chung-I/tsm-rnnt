@@ -5,7 +5,7 @@ local DECODER_HIDDEN_SIZE = 512;
 local VOCAB_PATH = "data/vocabulary/phn_level";
 local NUM_GPUS = 1;
 local CHAR_TARGET_NAMESPACE = "characters";
-local WORD_TARGET_NAMESPACE = "tokens";
+local WORD_TARGET_NAMESPACE = "target_tokens";
 local PHN_TARGET_NAMESPACE = "phonemes";
 local WORD_LEVEL = false;
 local TARGET_NAMESPACE = if WORD_LEVEL then WORD_TARGET_NAMESPACE else CHAR_TARGET_NAMESPACE;
@@ -76,7 +76,7 @@ local BASE_ITERATOR = {
   "batch_size" : BATCH_SIZE,
   "sorting_keys": [["source_features", "dimension_0"],
                     ["target_tokens", "num_tokens"]],
-  "max_instances_in_memory": 1024 * BATCH_SIZE,
+  "max_instances_in_memory": 256 * BATCH_SIZE,
   #"maximum_samples_per_batch": ["dimension_0", 36000],
   "track_epoch": true,
 };
@@ -255,7 +255,7 @@ local PTS_READER = {
     "ctc_layer": {
       "type": "ctc",
       "target_namespace": TARGET_NAMESPACE,
-      "loss_ratio": 0.5      
+      "loss_ratio": 0.0      
     },
     "projection_layer": {
       "_pretrained": {
@@ -269,21 +269,33 @@ local PTS_READER = {
       "input_size": ENCODER_OUTPUT_SIZE,
       "hidden_size": DECODER_HIDDEN_SIZE,
       "target_namespace": TARGET_NAMESPACE,
-      "loss_ratio": 0.5,
-      "recurrency": {
-        "_pretrained": {
-          "archive_file": "runs/lm/model.tar.gz",
-          "module_path": "_contextualizer._module",
-          "freeze": false
-        }
-      },
-      "target_embedder": {
-        "_pretrained": {
-          "archive_file": "runs/lm/model.tar.gz",
-          "module_path": "_text_field_embedder.token_embedder_tokens",
-          "freeze": false
-        }
-      }
+      "loss_ratio": 1.0,
+      "target_embedding_dim": DECODER_HIDDEN_SIZE,
+      "num_layers": 2,
+      // "attention": {
+      //   "type": "stateful",
+      //   "vector_dim": DECODER_HIDDEN_SIZE,
+      //   "matrix_dim": ENCODER_OUTPUT_SIZE,
+      //   "attention_dim": ENCODER_HIDDEN_SIZE,
+      //   "values_dim": ENCODER_HIDDEN_SIZE,
+      //   "num_heads" : 1,
+      //   "output_value": true,
+      //   "normalize": false
+      // },
+      // "recurrency": {
+      //   "_pretrained": {
+      //     "archive_file": "runs/lm/model.tar.gz",
+      //     "module_path": "_contextualizer._module",
+      //     "freeze": false
+      //   }
+      // },
+      // "target_embedder": {
+      //   "_pretrained": {
+      //     "archive_file": "runs/lm/model.tar.gz",
+      //     "module_path": "_text_field_embedder.token_embedder_tokens",
+      //     "freeze": false
+      //   }
+      // }
     },
     "encoder": {
       "_pretrained": {
@@ -308,6 +320,7 @@ local PTS_READER = {
     //   "hidden_channel": OUT_CHANNEL,
     //   "nonlinearity": "relu"
     // },
+    "att_ratio": 0.0,
     "cnn": {
       "_pretrained": {
         "archive_file": "runs/ctc/model.tar.gz",
@@ -340,18 +353,18 @@ local PTS_READER = {
       [".*_projection_layer.*", "prevent"],
       [".*_cnn.*", "prevent"],
       [".*_encoder.*", "prevent"],
-      [".*_recurrency.*", "prevent"],
+      #[".*_recurrency.*", "prevent"],
       [".*linear.*weight", {"type": "xavier_uniform"}],
       [".*linear.*bias", {"type": "zero"}],
       [".*weight_ih.*", {"type": "xavier_uniform"}],
       [".*weight_hh.*", {"type": "orthogonal"}],
       [".*bias_ih.*", {"type": "zero"}],
       [".*bias_hh.*", {"type": "lstm_hidden_bias"}],
-      #["_target_embedder.weight", {"type": "uniform", "a": -1, "b": 1}],
-      ["_target_embedder.weight", "prevent"],
+      ["_target_embedder.weight", {"type": "uniform", "a": -1, "b": 1}],
+      #["_target_embedder.weight", "prevent"],
     ]
   },
-  "iterator": BASE_ITERATOR + {"instances_per_epoch": 1280000},
+  "iterator": BASE_ITERATOR + {"instances_per_epoch": 128000},
   "validation_iterator": BASE_ITERATOR,
   // "iterator": {
   //   "type": "multiprocess",

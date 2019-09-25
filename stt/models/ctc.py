@@ -1,4 +1,4 @@
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Optional, List, Tuple, Any, Callable
 from itertools import groupby
 
 import os
@@ -19,10 +19,13 @@ from allennlp.models.model import Model
 from allennlp.nn import InitializerApplicator, RegularizerApplicator
 from allennlp.nn import util
 from allennlp.modules.token_embedders import Embedding
+from allennlp.modules.attention import Attention
 from allennlp.training.metrics import Average, Metric, BLEU
 
 from stt.models.util import remove_sentence_boundaries, list_to_tensor
 from stt.training.word_error_rate import WordErrorRate as WER
+from stt.models.util import prepare_attended_output_factory, maybe_update_state
+from stt.modules.residual_lstm import ResidualLSTM
 
 @Model.register("ctc")
 class CTCLayer(Model):
@@ -147,12 +150,14 @@ class RNNTLayer(Model):
                  hidden_size: int,
                  loss_ratio: float = 1.0,
                  recurrency: nn.LSTM = None,
+                 residual: bool = False,
                  num_layers: int = None,
                  remove_sos: bool = True,
                  remove_eos: bool = False,
                  target_embedder: Embedding = None,
                  target_embedding_dim: int = None,
                  target_namespace: str = "tokens",
+                 attention: Attention = None,
                  slow_decode: bool = False,
                  initializer: InitializerApplicator = InitializerApplicator(),
                  regularizer: Optional[RegularizerApplicator] = None) -> None:
@@ -161,6 +166,7 @@ class RNNTLayer(Model):
         self.loss_ratio = loss_ratio
         self._remove_sos = remove_sos
         self._remove_eos = remove_eos
+        self._hidden_size = hidden_size
         self._slow_decode = slow_decode
         self._target_namespace = target_namespace
         self._num_classes = self.vocab.get_vocab_size(target_namespace)
@@ -173,17 +179,38 @@ class RNNTLayer(Model):
 
         self._loss = warprnnt_pytorch.RNNTLoss(blank=self._pad_index,
                                                reduction='mean')
-        self._recurrency = recurrency or \
-            nn.LSTM(input_size=target_embedding_dim,
-                    hidden_size=hidden_size,
-                    num_layers=num_layers,
-                    batch_first=True)
+
+        self._attention = attention
+        self._input_size = target_embedding_dim
+        self._att_out = None
+        self.joint_network = self._joint
+        self._nonlinear = torch.tanh
+        if attention:
+            self.joint_network = self._attn_joint
+            self._input_size = target_embedding_dim + hidden_size
+            self._att_out = nn.Linear(self._input_size, hidden_size, bias=True)
+            self._init_hidden = nn.Parameter(torch.randn([1, hidden_size]))
+        self._decoder = recurrency
+        if self._decoder is None:
+            if residual:
+                self._decoder = nn.LSTM(input_size=self._input_size,
+                                        hidden_size=hidden_size,
+                                        num_layers=num_layers,
+                                        batch_first=True)
+            else:
+                self._decoder = ResidualLSTM(input_size=self._input_size,
+                                             hidden_size=hidden_size,
+                                             num_layers=num_layers)
+        num_directions = 2 if self._decoder.bidirectional else 1
+        self._num_layers_dirs = self._decoder.num_layers * num_directions
 
         self._target_embedder = target_embedder or Embedding(self._num_classes,
                                                              target_embedding_dim)
         self.w_enc = nn.Linear(input_size, hidden_size, bias=True)
         self.w_dec = nn.Linear(input_size, hidden_size, bias=False)
         self._proj = nn.Linear(hidden_size, self._num_classes)
+
+        self._prepare_attended_output = prepare_attended_output_factory(self)
 
         exclude_indices = {self._pad_index, self._end_index, self._start_index}
         self._wer: Metric = WER(exclude_indices=exclude_indices)
@@ -197,26 +224,42 @@ class RNNTLayer(Model):
 
     @overrides
     def forward(self,  # type: ignore
-                source_features: torch.FloatTensor,
-                source_lengths: torch.LongTensor,
+                state: Dict[str, torch.Tensor],
                 target_tokens: Dict[str, torch.LongTensor] = None) -> Dict[str, torch.Tensor]:
         output_dict: Dict[str, torch.FloatTensor] = {}
-
         targets = target_tokens[self._target_namespace]
-        dec_outs, _ = self._recurrency(self._target_embedder(targets), None)
-        logits = self._joint(source_features, dec_outs)
+        if self._attention:
+            state["att_keys"], state["att_values"] = \
+                self._attention.init_state(state["encoder_outputs"])
+        self._init_state(state, attn=(self.joint_network == self._attn_joint))
+        logits, _ = self.joint_network(state, targets)
+        source_lengths = util.get_lengths_from_binary_sequence_mask(state["source_mask"])
         log_probs = F.log_softmax(logits, dim=-1)
         loss = self._get_loss(log_probs, target_tokens, source_lengths)[0]
         if not self.training:
-            predictions = self._greedy_decode(source_features, source_lengths)
+            self._init_state(state, attn=(self.joint_network == self._attn_joint))
+            predictions = self._greedy_decode(state, source_lengths)
             relevant_targets = targets[:, 1:]
             self._wer(predictions, relevant_targets)
-            prediction_tensor = list_to_tensor(predictions, relevant_targets) 
+            prediction_tensor = list_to_tensor(predictions, relevant_targets)
             self._bleu(prediction_tensor, relevant_targets)
             output_dict["predictions"] = predictions
 
         output_dict["loss"] = loss
         return output_dict
+
+    def _init_state(self, state: Dict[str, torch.Tensor], attn: bool = False):
+        enc_outs = state["encoder_outputs"]
+        batch_size, enc_steps, _ = enc_outs.size()
+        fields = ["decoder_hidden", "decoder_context"]
+        for field in fields:
+            state[field] = enc_outs.new_zeros(batch_size, self._num_layers_dirs, self._hidden_size)
+            # state[f"prev_{field}"] = enc_outs.new_zeros(batch_size, self._num_layers_dirs, self._hidden_size)
+        if attn:
+            state["decoder_output"] = self._init_hidden.expand(batch_size, -1)
+            for field in fields + ["decoder_output"]:
+                state[field] = state[field].repeat_interleave(enc_steps, dim=0)\
+                    .view(batch_size, enc_steps, *state[field].size()[1:])
 
     def _get_loss(self, log_probs: torch.FloatTensor, target_tokens: Dict[str, torch.LongTensor],
                   source_lengths: torch.LongTensor) -> torch.FloatTensor:
@@ -230,7 +273,8 @@ class RNNTLayer(Model):
                           source_lengths.int(), target_lengths.int())
         return loss
 
-    def _joint(self, eouts, douts, non_linear=torch.tanh):
+    def _joint(self, state: Dict[str, torch.Tensor], targets: torch.Tensor,
+               enc_indices: torch.Tensor = None):
         """Combine encoder outputs and prediction network outputs.
         Args:
             eouts (FloatTensor): `[B, T, n_units]`
@@ -239,11 +283,96 @@ class RNNTLayer(Model):
             out (FloatTensor): `[B, T, L, vocab]`
         """
         # broadcast
+        eouts = state["encoder_outputs"]
+        if enc_indices is not None:
+            eouts = eouts[torch.arange(enc_indices.size(0)), enc_indices].unsqueeze(1)
+        state["prev_decoder_hidden"] = state["decoder_hidden"]
+        state["prev_decoder_context"] = state["decoder_context"]
+        decoder_hidden = state["decoder_hidden"].transpose(1, 0).contiguous()
+        decoder_context = state["decoder_context"].transpose(1, 0).contiguous()
+        douts, (decoder_hidden, decoder_context) = \
+            self._decoder(self._target_embedder(targets), (decoder_hidden, decoder_context))
+        state["decoder_hidden"] = decoder_hidden.transpose(1, 0)
+        state["decoder_context"] = decoder_context.transpose(1, 0)
         eouts = eouts.unsqueeze(2)  # `[B, T, 1, n_units]`
         douts = douts.unsqueeze(1)  # `[B, 1, L, n_units]`
-        out = non_linear(self.w_enc(eouts) + self.w_dec(douts))
+        out = self._nonlinear(self.w_enc(eouts) + self.w_dec(douts))
         out = self._proj(out)
-        return out
+        output_dict: Dict[str, torch.Tensor] = {}
+        output_dict["logits"] = out
+        output_dict["states"] = state
+        return output_dict
+
+    def _attn_joint(self, state: Dict[str, torch.Tensor], targets: torch.Tensor,
+                    enc_indices: torch.Tensor = None):
+        _, dec_steps = targets.size()
+        step_outputs: List[torch.Tensor] = []
+        step_attns: List[torch.Tensor] = []
+        for i in range(dec_steps):
+            decoder_output, state = self._prepare_decoder_output(targets[:, i], state)
+            step_outputs.append(decoder_output)
+            step_attns.append(state["attentions"])
+        decoder_outputs = torch.stack(step_outputs, dim=2)
+        logits = self._proj(decoder_outputs)
+        attentions = torch.stack(step_attns, dim=1)
+        if enc_indices is not None:
+            logits = logits[torch.arange(enc_indices.size(0)), enc_indices]
+            attentions = attentions[torch.arange(enc_indices.size(0)), :, enc_indices]
+        return logits, state
+
+    def _prepare_decoder_output(self, last_predictions: torch.Tensor,
+                                state: Dict[str, torch.Tensor]):
+        decoder_output = state["decoder_output"]
+        batch_size, enc_steps, _ = decoder_output.size()
+        group_size = batch_size * enc_steps
+        if state["decoder_hidden"] is None or state["decoder_context"] is None:
+            hx = None
+        else:
+            state["prev_decoder_hidden"] = state["decoder_hidden"]
+            state["prev_decoder_context"] = state["decoder_context"]
+            state["prev_decoder_output"] = state["decoder_output"]
+            decoder_hidden = state["decoder_hidden"].reshape(group_size, -1, self._hidden_size).transpose(1, 0)
+            decoder_context = state["decoder_context"].reshape(group_size, -1, self._hidden_size).transpose(1, 0)
+            hx = (decoder_hidden.contiguous(), decoder_context.contiguous())
+        keys = state["att_keys"]#.repeat(enc_steps, 1, 1).view(group_size, enc_steps, -1)
+        values = state["att_values"]#.repeat(enc_steps, 1, 1).view(group_size, enc_steps, -1)
+        source_mask = state["source_mask"]#.repeat(enc_steps, 1).view(group_size, -1)
+
+        embedded_input = self._target_embedder(last_predictions)
+        queries = self._attention._query_projection(decoder_output)
+        flattened_attns = torch.bmm(queries, keys.transpose(-2, -1))
+        #flattened_attns = torch.einsum('bnlh,bhk->bnl', queries.unsqueeze(1).expand(-1, enc_steps, -1, -1),
+        #                               keys.transpose(-2, -1))
+        #_, flattened_attns, flattened_values = self._attention(decoder_output.view(group_size, -1),
+        #                                                       att_keys,
+        #                                                       att_values,
+        #                                                       source_mask)
+
+        #values = flattened_values.view(batch_size, enc_steps, enc_steps, -1)
+        attns = flattened_attns.view(batch_size, enc_steps, -1)
+        lookback_mask = util.get_mask_from_sequence_lengths(torch.arange(1, enc_steps + 1, device=source_mask.device),
+                                                            enc_steps)
+        attn_mask = source_mask.view(batch_size, enc_steps, -1) * lookback_mask.unsqueeze(0).expand(batch_size, -1, -1)
+        attns = util.masked_softmax(attns, attn_mask)
+        attn_cxts = util.weighted_sum(values, attns)
+        attn_outputs = self._attention._output_projection(attn_cxts)
+
+        decoder_input = torch.cat((embedded_input.repeat(enc_steps, 1).view(batch_size, enc_steps, -1),
+                                   attn_outputs), -1)
+        _, (decoder_hidden, decoder_context) = self._decoder(
+            decoder_input.view(batch_size*enc_steps, -1).unsqueeze(1),
+            hx)
+
+        decoder_hidden = decoder_hidden.transpose(1, 0).reshape(batch_size, enc_steps, -1, self._hidden_size)
+        decoder_context = decoder_context.transpose(1, 0).reshape(batch_size, enc_steps, -1, self._hidden_size)
+        #outputs = outputs.reshape(batch_size, enc_steps, -1, self._hidden_size)
+
+        state["decoder_hidden"] = decoder_hidden
+        state["decoder_context"] = decoder_context
+        state["decoder_output"] = decoder_hidden[..., 0, :]
+        state["attentions"] = attns
+
+        return decoder_hidden[..., -1, :], state
 
     def _slow_greedy_decode(self, eouts, elens,
                             exclude_eos=False, oracle=False,
@@ -270,7 +399,7 @@ class RNNTLayer(Model):
             best_hyp_b = []
             # Initialization
             y = elens.new_zeros((1, 1)).fill_(self._start_index)
-            dout, dstate = self._recurrency(self._target_embedder(y), None)
+            dout, dstate = self._decoder(self._target_embedder(y), None)
 
             t = 0
             while t < elens[b]:
@@ -291,7 +420,7 @@ class RNNTLayer(Model):
                     if oracle:
                         raise NotImplementedError
                         y = eouts.new_zeros(1, 1).fill_(refs_id[b, len(best_hyp_b) - 1])
-                    dout, dstate = self._recurrency(self._target_embedder(y), dstate)
+                    dout, dstate = self._decoder(self._target_embedder(y), dstate)
                 else:
                     t += 1
 
@@ -299,7 +428,7 @@ class RNNTLayer(Model):
 
         return hyps
 
-    def _greedy_decode(self, eouts: torch.Tensor, elens: torch.Tensor,
+    def _greedy_decode(self, state: Dict[str, torch.Tensor], elens: torch.Tensor,
                        dlens: torch.Tensor = None) -> List[List[int]]:
         """
         Batch decoding for RNN Transducer.
@@ -318,47 +447,48 @@ class RNNTLayer(Model):
         -------
         Dict[str, torch.Tensor]
         """
+        eouts = state["encoder_outputs"]
         batch_size, max_enc_len, _ = eouts.size()
         if dlens is None:
             dlens = elens.new_full(elens.size(), max_enc_len)
         # Initialize target predictions with the start index.
         # shape: (batch_size,)
-        y = elens.new_zeros((batch_size, 1)).fill_(self._start_index)
-        dout, dstate = self._recurrency(self._target_embedder(y), None)
+        last_predictions = elens.new_zeros((batch_size, 1)).fill_(self._start_index)
         # current source position t for each element in a batch.
         cur_enc_indices = elens.new_zeros((batch_size,))
         end_indices = elens
         # decoding finished when each current source position equals to the
         # end_indices.
         finished = (cur_enc_indices == end_indices)
-        batch_indices = torch.arange(batch_size)
         # total steps traversed in the latttices, including horizontal steps
         # (blanks).
         hyp_lens = elens.new_zeros((batch_size,))
         hypotheses = []
-        is_pad = lambda y, shape, tensor: y.view(*shape) \
-            .expand_as(tensor) == self._pad_index
+
         while not finished.all():
             hyp_lens += (~finished).long()
             # for finished batch elements with cur_enc_indices == end_indices,
             # we clamped it to prevent IndexError.
             clamped_indices = torch.min(cur_enc_indices, end_indices - 1)
-            out = self._joint(eouts[batch_indices, clamped_indices].unsqueeze(1), dout)
+            out, state = self.joint_network(state,
+                                            last_predictions,
+                                            clamped_indices)
+
             y = out.argmax(-1).squeeze(1)
-            hypotheses.append(y.squeeze(1))
-            maybe_dout, maybe_dstate = self._recurrency(self._target_embedder(y),
-                                                             dstate)
+            hypotheses.append(y.squeeze(-1))
             # state will not be updated for those who output blanks (horizontal
             # steps).
-            dout = torch.where(is_pad(y, (-1, 1, 1), dout), dout, maybe_dout)
-            dstate = tuple(torch.where(is_pad(y, (1, -1, 1), dstate[i]), dstate[i], maybe_dstate[i])
-                           for i in range(len(maybe_dstate)))
+            state = maybe_update_state(state, y, self._pad_index)
+
             cur_enc_indices = torch.min(end_indices,
                                         cur_enc_indices + (y.view(-1) == self._pad_index).long())
             finished = (cur_enc_indices == (end_indices)) | (y.view(-1) == self._end_index) | \
                         (hyp_lens > (elens + dlens))
 
         raw_hypotheses = torch.stack(hypotheses, dim=-1)
+        hypotheses_for_logging = [hypothesis[:hyp_len]
+                      for hypothesis, hyp_len in zip(raw_hypotheses.tolist(), hyp_lens.tolist())]
+        #print(hypotheses_for_logging)
         hypotheses = [list(filter(lambda idx: idx != self._pad_index, hypothesis[:hyp_len]))
                       for hypothesis, hyp_len in zip(raw_hypotheses.tolist(), hyp_lens.tolist())]
         return hypotheses

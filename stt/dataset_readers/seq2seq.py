@@ -59,6 +59,8 @@ class Seq2SeqDatasetReader(DatasetReader):
                  source_token_indexers: Dict[str, TokenIndexer] = None,
                  target_token_indexers: Dict[str, TokenIndexer] = None,
                  source_add_start_token: bool = True,
+                 source_max_len: int = 0,
+                 target_max_len: int = 0,
                  delimiter: str = "\t",
                  lazy: bool = False) -> None:
         super().__init__(lazy)
@@ -70,6 +72,8 @@ class Seq2SeqDatasetReader(DatasetReader):
             "tokens": SingleIdTokenIndexer()}
         self._target_token_indexers = target_token_indexers or self._source_token_indexers
         self._source_add_start_token = source_add_start_token
+        self._source_max_len = source_max_len if source_max_len > 0 else float('inf')
+        self._target_max_len = target_max_len if target_max_len > 0 else float('inf')
         self._delimiter = delimiter
 
     @overrides
@@ -77,14 +81,22 @@ class Seq2SeqDatasetReader(DatasetReader):
         counter = 0
         path = Path(file_path)
         file_prefix = str(path.parent.joinpath(path.stem))
+        dropped_instances = 0
         with open(".".join([file_prefix, self._source_affix]), "r") as source_file:
             with open(".".join([file_prefix, self._target_affix]), "r") as target_file:
                 for source_sequence, target_sequence in zip(source_file, target_file):
-                    if counter > 10000:
-                        break
-                    yield self.text_to_instance(source_sequence, target_sequence)
-                    counter += 1
-                    del source_sequence, target_sequence
+                    instance = self.text_to_instance(source_sequence, target_sequence)
+                    src_len = instance.fields['source_tokens'].sequence_length()
+                    tgt_len = instance.fields['target_tokens'].sequence_length()
+                    if src_len > self._source_max_len or tgt_len > self._target_max_len:
+                        dropped_instances += 1
+                    else:
+                        yield instance
+        if not dropped_instances:
+            logger.info("No instances dropped from {}.".format(file_path))
+        else:
+            logger.warning("Dropped {} instances from {}.".format(dropped_instances,
+                                                                  file_path))
 
     @overrides
     def text_to_instance(self, source_string: str, target_string: str = None) -> Instance:  # type: ignore

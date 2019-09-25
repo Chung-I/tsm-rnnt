@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.linear import Linear
+from torch.nn import AdaptiveLogSoftmaxWithLoss
 import warprnnt_pytorch
 
 from allennlp.common.checks import ConfigurationError
@@ -26,10 +27,12 @@ from allennlp.nn import InitializerApplicator
 
 from stt.models.awd_rnn import AWDRNN
 from stt.training.word_error_rate import WordErrorRate as WER
-from stt.modules.losses import OCDLoss, EDOCDLoss, maybe_sample_from_candidates
+from stt.modules.losses import OCDLoss, EDOCDLoss, maybe_sample_from_candidates, SoftmaxWithLoss
 from stt.modules.losses import target_to_candidates
 from stt.models.util import averaging_tensor_of_same_label, remove_sentence_boundaries, char_to_word
 from stt.models.util import remove_eos as _remove_eos
+from stt.models.util import sequence_cross_entropy_with_log_probs
+from stt.models.util import prepare_decoder_output_factory, prepare_attended_output_factory
 from stt.models.ctc import CTCLayer, RNNTLayer
 from stt.modules.attention import MonotonicAttention, differentiable_average_lagging
 from stt.modules.stateful_attention import StatefulAttention
@@ -88,12 +91,13 @@ class PhnMoChA(Model):
     def __init__(self,
                  vocab: Vocabulary,
                  encoder: Seq2SeqEncoder,
-                 input_size: int,
                  target_embedding_dim: int,
                  max_decoding_steps: int,
+                 input_size: int = None,
                  max_decoding_ratio: float = 1.5,
                  dep_parser: Model = None,
                  pos_tagger: Model = None,
+                 source_embedder: TextFieldEmbedder = None,
                  cmvn: str = 'none',
                  delta: bool = False,
                  acceleration: bool = False,
@@ -123,6 +127,7 @@ class PhnMoChA(Model):
                  sampling_strategy: str = "max",
                  from_candidates: bool = False,
                  scheduled_sampling_ratio: float = 0.,
+                 splits: List[int] = None,
                  initializer: InitializerApplicator = InitializerApplicator()) -> None:
         super(PhnMoChA, self).__init__(vocab)
         self._input_size = input_size
@@ -132,6 +137,7 @@ class PhnMoChA(Model):
         self._sampling_strategy = sampling_strategy
         self._train_at_phn_level = train_at_phn_level
 
+        self._source_embedder = source_embedder
         self._dep_parser = dep_parser
         self._pos_tagger = pos_tagger
         self._ctc_layer = ctc_layer
@@ -206,7 +212,7 @@ class PhnMoChA(Model):
         #self._decoder_output_dim = self._encoder_output_dim
         self._decoder_output_dim = target_embedding_dim
         self._dec_layers = dec_layers
-        if self._decoder_output_dim != self._encoder_output_dim:
+        if self._encoder_output_dim != self._dec_layers * self._decoder_output_dim:
             self.bridge = nn.Linear(
                 self._encoder_output_dim, self._dec_layers * self._decoder_output_dim, bias=False)
 
@@ -215,7 +221,7 @@ class PhnMoChA(Model):
             # to the previous target embedding to form the input to the decoder at each
             # time step.
             self._decoder_input_dim = self._decoder_output_dim + target_embedding_dim
-            self.att_out = Linear(self._decoder_output_dim + self._encoder_output_dim,
+            self._att_out = Linear(self._decoder_output_dim + self._encoder_output_dim,
                                   self._decoder_output_dim, bias=True)
         else:
             # Otherwise, the input to the decoder is just the previous target embedding.
@@ -229,8 +235,12 @@ class PhnMoChA(Model):
 
         # We project the hidden state from the decoder into the output vocabulary space
         # in order to get log probabilities of each target token, at each time step.
-        self._output_projection_layer = Linear(
-            self._decoder_output_dim, num_classes)
+        self._crit = None
+        if splits is not None:
+            self._crit = AdaptiveLogSoftmaxWithLoss(
+                self._decoder_output_dim, num_classes, splits)
+        else:
+            self._crit = SoftmaxWithLoss(self._decoder_output_dim, num_classes)
 
         self._input_norm = lambda x: x
         if cmvn == 'global':
@@ -274,6 +284,8 @@ class PhnMoChA(Model):
 
         self.time_mask = TimeMask(time_mask_width, time_mask_max_ratio)
         self.freq_mask = FreqMask(freq_mask_width)
+        self._prepare_attended_output = prepare_attended_output_factory(self)
+        self._prepare_decoder_output = prepare_decoder_output_factory(self)
 
         initializer(self)
 
@@ -311,18 +323,17 @@ class PhnMoChA(Model):
             for each source sentence in the batch.
         """
         # shape: (group_size, num_classes)
-        output_projections, state = self._prepare_output_projections(
+        decoder_output, state = self._prepare_decoder_output(
             last_predictions, state)
-
-        # shape: (group_size, num_classes)
-        class_log_probabilities = F.log_softmax(output_projections, dim=-1)
+        class_log_probabilities = self._crit.log_prob(decoder_output)
 
         return class_log_probabilities, state
 
     @overrides
     def forward(self,  # type: ignore
-                source_features: torch.FloatTensor,
-                source_lengths: torch.LongTensor,
+                source_features: torch.FloatTensor = None,
+                source_tokens: Dict[str, torch.LongTensor] = None,
+                source_lengths: torch.LongTensor = None,
                 target_tokens: Dict[str, torch.LongTensor] = None,
                 words: Dict[str, torch.LongTensor] = None,
                 segments: torch.LongTensor = None,
@@ -349,6 +360,7 @@ class PhnMoChA(Model):
         -------
         Dict[str, torch.Tensor]
         """
+
         output_dict = {}
         if dataset is not None:
             self._target_granularity = dataset[0]
@@ -357,15 +369,25 @@ class PhnMoChA(Model):
             self._epoch_num = epoch_num[0]
         self.set_output_layer_num()
 
-        source_mask = util.get_mask_from_sequence_lengths(source_lengths,
-                                                          source_features.size(1)).bool()
-        source_features = self._input_norm(
-            source_features.transpose(-2, -1)).transpose(-2, -1)
-        source_features = self.time_mask(source_features, source_mask)
-        source_features = self.freq_mask(source_features, source_mask)
+        if source_features is not None:
+            if source_lengths is None:
+                raise ValueError("'source_features' is provided but no 'source_lengths' specified")
+            source_mask = util.get_mask_from_sequence_lengths(source_lengths,
+                                                              source_features.size(1)).bool()
+            source_features = self._input_norm(
+                source_features.transpose(-2, -1)).transpose(-2, -1)
+            source_features = self.time_mask(source_features, source_mask)
+            source_features = self.freq_mask(source_features, source_mask)
 
-        source_features = source_features.masked_fill(
-            ~source_mask.unsqueeze(-1).expand_as(source_features), 0.0)
+            source_features = source_features.masked_fill(
+                ~source_mask.unsqueeze(-1).expand_as(source_features), 0.0)
+        elif source_tokens is not None:
+            source_features = self._source_embedder(source_tokens)
+            source_mask = util.get_text_field_mask(source_tokens)
+            source_lengths = util.get_lengths_from_binary_sequence_mask(source_mask)
+        else:
+            raise AssertionError("at least one of 'source_tokens' and 'source_features' should be provided")
+
         state = self._encode(source_features, source_lengths)
         source_lengths = util.get_lengths_from_binary_sequence_mask(state["source_mask"])
         target_tokens["mask"] = (target_tokens[self._target_namespace] != self._pad_index).bool()
@@ -378,7 +400,7 @@ class PhnMoChA(Model):
             # output_dict.update({f"phn_ctc_{key}": value for key, value in phn_ctc_output_dict.items()})
 
         if self._rnnt_layer is not None and self._rnnt_layer.loss_ratio > 0.0:
-            rnnt_output_dict = self._rnnt_layer(state["encoder_outputs"], source_lengths, target_tokens)
+            rnnt_output_dict = self._rnnt_layer(state, target_tokens)
             output_dict.update({f"rnnt_{key}": value for key, value in rnnt_output_dict.items()})
         if self._ctc_layer is not None and self._ctc_layer.loss_ratio > 0.0:
             logits = self._projection_layer(state["encoder_outputs"])
@@ -399,7 +421,8 @@ class PhnMoChA(Model):
 
             state = self._init_decoder_state(state)
             output_dict.update(self._forward_loop(state, target_tokens))
-            self._logs["att_wer"](output_dict["predictions"], targets)
+            if self.training:
+                self._logs["att_wer"](output_dict["predictions"], targets)
 
             if self._dep_parser or self._pos_tagger:
                 relevant_mask = target_mask[:, 1:]
@@ -437,8 +460,8 @@ class PhnMoChA(Model):
 
         if self.training:
             output_dict = self._collect_losses(output_dict,
-                                               ctc=self._ctc_layer.loss_ratio,
-                                               rnnt=self._rnnt_layer.loss_ratio,
+                                               ctc=(self._ctc_layer.loss_ratio if self._ctc_layer else 0),
+                                               rnnt=(self._rnnt_layer.loss_ratio if self._ctc_layer else 0),
                                                att=self._att_ratio,
                                                dal=self._latency_penalty,
                                                dep=self._dep_ratio,
@@ -595,7 +618,7 @@ class PhnMoChA(Model):
         last_predictions = source_mask.new_full(
             (batch_size,), fill_value=self._start_index)
 
-        step_logits: List[torch.Tensor] = []
+        step_log_probs: List[torch.Tensor] = []
         step_predictions: List[torch.Tensor] = []
         step_attns: List[torch.Tensor] = []
         step_attn_cxts: List[torch.Tensor] = []
@@ -617,31 +640,21 @@ class PhnMoChA(Model):
                 input_choices = targets[:, timestep]
 
             # shape: (batch_size, num_classes)
-            output_projections, state = self._prepare_output_projections(
+            decoder_output, state = self._prepare_decoder_output(
                 input_choices, state)
+            class_log_probabilities = self._crit.log_prob(decoder_output)
+            step_log_probs.append(class_log_probabilities.unsqueeze(1))
 
-            # list of tensors, shape: (batch_size, 1, num_classes)
-            step_logits.append(output_projections.unsqueeze(1))
-
-            # list of tensors, shape: (batch_size, 1, num_encoding_steps)
             if self._attention:
                 step_attns.append(state["attention"].unsqueeze(1))
                 step_attn_cxts.append(state["attention_contexts"].unsqueeze(1))
 
-            # shape: (batch_size, num_classes)
-            class_probabilities = F.softmax(output_projections, dim=-1)
-
-            # shape (predicted_classes): (batch_size,)
-
-            predicted_classes = maybe_sample_from_candidates(class_probabilities,
+            predicted_classes = maybe_sample_from_candidates(class_log_probabilities,
                                                              candidates=(candidates
                                                                          if self._from_candidates
                                                                          else None),
                                                              strategy=self._sampling_strategy)
-
-            # shape (predicted_classes): (batch_size,)
             last_predictions = predicted_classes
-
             step_predictions.append(last_predictions.unsqueeze(1))
 
         # shape: (batch_size, num_decoding_steps)
@@ -657,12 +670,11 @@ class PhnMoChA(Model):
             output_dict["attention_contexts"] = torch.cat(step_attn_cxts, 1)
 
         if target_tokens:
-            # shape: (batch_size, num_decoding_steps, num_classes)
-            logits = torch.cat(step_logits, 1)
-
-            # Compute loss.
             target_mask = util.get_text_field_mask(target_tokens)
-            loss = self._get_loss(logits, predictions,
+            # shape: (batch_size, num_decoding_steps, num_classes)
+            log_probs = torch.cat(step_log_probs, 1)
+            # Compute loss.
+            loss = self._get_loss(log_probs, predictions,
                                   targets, target_mask, candidates)
 
             output_dict["att_loss"] = loss
@@ -691,109 +703,8 @@ class PhnMoChA(Model):
         }
         return output_dict
 
-    def _prepare_output_projections(self,
-                                    last_predictions: torch.Tensor,
-                                    state: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:  # pylint: disable=line-too-long
-        """
-        Decode current state and last prediction to produce produce projections
-        into the target space, which can then be used to get probabilities of
-        each target token for the next step.
-
-        Inputs are the same as for `take_step()`.
-        """
-        # shape: (group_size, decoder_output_dim)
-        decoder_hidden = state["decoder_hidden"]
-
-        # shape: (group_size, decoder_output_dim)
-        decoder_context = state["decoder_context"]
-
-        # shape: (group_size, decoder_output_dim)
-        decoder_output = state["decoder_output"]
-
-        attention = state["attention"]
-
-        # shape: (group_size, target_embedding_dim)
-        embedded_input = self._target_embedder(last_predictions)
-
-        # shape: (group_size, decoder_output_dim + target_embedding_dim)
-        decoder_input = torch.cat((embedded_input, decoder_output), -1)
-
-        # shape (decoder_hidden): (batch_size, decoder_output_dim)
-        # shape (decoder_context): (batch_size, decoder_output_dim)
-        outputs, (decoder_hidden, decoder_context) = self._decoder(
-            decoder_input.unsqueeze(1),
-            (decoder_hidden.transpose(1, 0).contiguous(),
-             decoder_context.transpose(1, 0).contiguous()))
-
-        decoder_hidden = decoder_hidden.transpose(1, 0).contiguous()
-        decoder_context = decoder_context.transpose(1, 0).contiguous()
-        outputs = outputs.squeeze(1)
-        if self._attention:
-            # shape: (group_size, encoder_output_dim)
-            attended_output, attention = self._prepare_attended_output(outputs, state)
-
-            # shape: (group_size, decoder_output_dim)
-            decoder_output = torch.tanh(
-                self.att_out(torch.cat((attended_output, outputs), -1))
-            )
-            state["attention"] = attention
-            state["attention_contexts"] = attended_output
-
-        else:
-            # shape: (group_size, target_embedding_dim)
-            decoder_output = outputs
-
-        state["decoder_hidden"] = decoder_hidden
-        state["decoder_context"] = decoder_context
-        state["decoder_output"] = decoder_output
-
-        # shape: (group_size, num_classes)
-        output_projections = self._output_projection_layer(decoder_output)
-
-        return output_projections, state
-
-    def _prepare_attended_output(self,
-                                 decoder_hidden_state: torch.Tensor,
-                                 state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Apply attention over encoder outputs and decoder state."""
-        # Ensure mask is also a FloatTensor. Or else the multiplication within
-        # attention will complain.
-        # shape: (batch_size, max_input_sequence_length)
-
-        encoder_outputs = state["encoder_outputs"]
-        source_mask = state["source_mask"]
-        prev_attention = state["attention"]
-        att_keys = state["att_keys"]
-        att_values = state["att_values"]
-
-        # shape: (batch_size, max_input_sequence_length)
-        mode = "soft" if self.training else "hard"
-        if isinstance(self._attention, MonotonicAttention):
-            encoder_outs: Dict[str, torch.Tensor] = {
-                "value": state["encoder_outputs"],
-                "mask": state["source_mask"]
-            }
-
-            monotonic_attention, chunk_attention = self._attention(
-                encoder_outs, decoder_hidden_state, prev_attention, mode=mode)
-            # shape: (batch_size, encoder_output_dim)
-            attended_output = util.weighted_sum(
-                encoder_outputs, chunk_attention)
-            attention = monotonic_attention
-        elif isinstance(self._attention, StatefulAttention):
-            attended_output, attention = self._attention(decoder_hidden_state,
-                                                         att_keys, att_values, source_mask)
-        else:
-            attention = self._attention(
-                decoder_hidden_state, source_mask)
-            attended_output = util.weighted_sum(
-                encoder_outputs, attention)
-
-        return attended_output, attention
-
-    # @staticmethod
     def _get_loss(self,
-                  logits: torch.FloatTensor,
+                  log_probs: torch.FloatTensor,
                   predictions: torch.LongTensor,
                   targets: torch.LongTensor,
                   target_mask: torch.LongTensor,
@@ -834,12 +745,11 @@ class PhnMoChA(Model):
                 self._loss.update_temperature(self._epoch_num)
 
             if isinstance(self._loss, EDOCDLoss):
-                log_probs = F.log_softmax(logits, dim=-1)
                 return self._loss(log_probs, predictions, relevant_targets, relevant_mask)
             else:
                 raise NotImplementedError
 
-        return util.sequence_cross_entropy_with_logits(logits, relevant_targets, relevant_mask)
+        return sequence_cross_entropy_with_log_probs(log_probs, relevant_targets, relevant_mask)
 
     def _collect_losses(self,
                         output_dict: Dict[str, torch.Tensor],
@@ -893,6 +803,7 @@ class PhnMoChA(Model):
                     all_metrics.update(metric_values)
                 else:
                     all_metrics[key] = metric_values
+
         if self._ctc_layer:
             all_metrics.update({f"ctc_{key}": value for key, value in
                                 self._ctc_layer.get_metrics(reset=reset).items()})

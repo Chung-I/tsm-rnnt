@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
-
 import torch.nn.functional as F
-from torch.autograd import Variable
 
 
 def as_set(targets: torch.LongTensor):
@@ -33,18 +31,18 @@ def target_to_candidates(targets, label_size, ignore_indices):
     return targets
 
 
-def maybe_sample_from_candidates(probs: torch.FloatTensor,
+def maybe_sample_from_candidates(log_probs: torch.FloatTensor,
                                  candidates: torch.LongTensor = None,
                                  strategy="sample"):
     assert strategy in ["sample", "max"], "strategy must be one of [sample, max], \
         got {} instead".format(strategy)
     if candidates is not None:
         mask = (1 - (candidates > 0)).byte().to(probs.device)
-        probs = probs.masked_fill(mask, 0)
+        log_probs = log_probs.masked_fill(mask, float('-inf'))
     if strategy == "sample":
-        predicted_classes = probs.multinomial(1).squeeze(1)
+        predicted_classes = log_probs.exp().multinomial(1).squeeze(1)
     else:
-        _, predicted_classes = probs.max(1)
+        _, predicted_classes = log_probs.max(1)
 
     return predicted_classes
 
@@ -274,3 +272,15 @@ class OrderFreeLoss(nn.Module):
             0, 1)) * mask  # (batch_size, label_size, seq_len)
         loss = torch.sum(losses) / torch.sum(mask)
         return loss
+
+class SoftmaxWithLoss(nn.Module):
+    def __init__(self, in_features: int, n_classes: int, proj_bias: bool = False):
+        super(SoftmaxWithLoss, self).__init__()
+        self.in_features = in_features
+        self.proj_bias = proj_bias
+        self.n_classes = n_classes
+        self.proj = nn.Linear(self.in_features, self.n_classes, bias=self.proj_bias)
+
+    def log_prob(self, input):
+        output = self.proj(input)
+        return F.log_softmax(output, dim=-1)

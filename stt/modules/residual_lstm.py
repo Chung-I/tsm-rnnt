@@ -6,9 +6,9 @@ from allennlp.modules.input_variational_dropout import InputVariationalDropout
 from allennlp.modules.seq2seq_encoders import _Seq2SeqWrapper
 from allennlp.modules.seq2seq_encoders.seq2seq_encoder import Seq2SeqEncoder
 from allennlp.common.checks import ConfigurationError
+from allennlp.common.registrable import Registrable
 
-
-class ResidualBidirectionalLstm(nn.Module):
+class ResidualLSTM(nn.Module):
     """
     A standard stacked Bidirectional LSTM where the LSTM layers
     are concatenated between each layer. The only difference between
@@ -46,14 +46,16 @@ class ResidualBidirectionalLstm(nn.Module):
                  num_layers: int,
                  layer_dropout_probability: float = 0.0,
                  use_residual: bool = True,
-                 use_residual_projection: bool = False) -> None:
-        super(ResidualBidirectionalLstm, self).__init__()
+                 use_residual_projection: bool = False,
+                 bidirectional: bool = False) -> None:
+        super(ResidualLSTM, self).__init__()
 
         # Required to be wrapped with a :class:`PytorchSeq2SeqWrapper`.
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.bidirectional = True
+        self.bidirectional = bidirectional
+        self.directions = (2 if self.bidirectional else 1)
         self.use_residual = use_residual
         self.use_residual_projection = use_residual_projection
 
@@ -64,16 +66,16 @@ class ResidualBidirectionalLstm(nn.Module):
             layer = nn.LSTM(lstm_input_size, hidden_size,
                             num_layers=1,
                             batch_first=True,
-                            bidirectional=True)
+                            bidirectional=self.bidirectional)
 
             if use_residual and layer_index < (self.num_layers - 1):
-                if use_residual_projection or lstm_input_size != hidden_size * 2:
-                    residual_projection = nn.Linear(lstm_input_size, hidden_size * 2, bias=False)
+                if use_residual_projection or lstm_input_size != hidden_size * self.directions:
+                    residual_projection = nn.Linear(lstm_input_size, hidden_size * self.directions, bias=False)
                 else:
                     residual_projection = nn.Identity()
                 self.add_module('res_proj_{}'.format(layer_index), residual_projection)
 
-            lstm_input_size = hidden_size * 2
+            lstm_input_size = hidden_size * self.directions
             self.add_module('layer_{}'.format(layer_index), layer)
             layers.append(layer)
 
@@ -142,4 +144,4 @@ class ResidualBidirectionalLstm(nn.Module):
         return output_sequence, final_state_tuple
 
 
-Seq2SeqEncoder.register("residual_bidirectional_lstm")(_Seq2SeqWrapper(ResidualBidirectionalLstm))
+Seq2SeqEncoder.register("residual_lstm")(_Seq2SeqWrapper(ResidualLSTM))
