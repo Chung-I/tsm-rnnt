@@ -1,0 +1,5 @@
+export LEXICON_PATH="/volume/asr-share/taiwanese/lexicon.txt"
+export CTC_MODEL_PATH="/volume/asr-share/taiwanese/ctc/"
+export TRAIN_DATA_DIR="/volume/asr-share/taiwanese/corpus/trains/"
+export VAL_DATA_DIR="/volume/asr-share/taiwanese/corpus/valids/"
+export VOCAB_PATH="/volume/asr-share/taiwanese/vocabulary"
