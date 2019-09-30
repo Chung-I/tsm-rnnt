@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import functools
-import tqdm
+from tqdm import tqdm
 
 import numpy as np
 from opencc import OpenCC
@@ -49,7 +49,7 @@ def read_dependencies(file_path: str, use_language_specific_pos=False):
 
     annotations = []
     with open(os.path.join(file_path, "dep.conll"), "r") as conllu_file:
-        for annotation in tqdm.tqdm(parse_incr(conllu_file)):
+        for annotation in tqdm(parse_incr(conllu_file)):
             annotation = [x for x in annotation if isinstance(x["id"], int)]
 
             heads = [x["head"] for x in annotation]
@@ -63,7 +63,7 @@ def read_dependencies(file_path: str, use_language_specific_pos=False):
 
     return annotations
 
-def data_func_factory(data_gen, orders):
+def data_func_factory(data_gen, orders = None):
     def data_func(idx):
         if orders is not None:
             idx = orders[idx]
@@ -115,31 +115,58 @@ def mao_get_datas(file_path: str, online: bool = False,
 
 def kaldi_get_datas(file_path: str, targets: List[Tuple[str]],
                     dep: bool = False) -> Tuple[Callable, Callable, Callable, int]:
-    raw_src_datas: Dict[str, np.array] = {k: m for k, m in kaldi_io.read_mat_scp(file_path)}
-    source_datas = []
-    target_datas = []
-    for utt_ids, src_trns, *tgt_trns in targets:
-        utt_datas = []
-        for utt_id in utt_ids:
-            utt_datas.append(raw_src_datas[utt_id])
-        source_data = np.concatenate((utt_datas), axis=-1)
-        source_datas.append(source_data)
-        target_datas.append(tgt_trns[0])
 
-    src_lens = [src.shape[0] for src in source_datas]
-    source_orders = np.argsort(src_lens)
+    def get_src_data_factory(raw_src_datas):
+        def func(utt_ids):
+            utt_datas = []
+            for utt_id in utt_ids:
+                rx_file = raw_src_datas[utt_id]
+                utt_datas.append(kaldi_io.read_mat(rx_file))
+            source_data = np.concatenate((utt_datas), axis=0)
+            return source_data
+        return func
 
-    src_data_func = data_func_factory(lambda idx: source_datas[idx], source_orders)
-    tgt_data_func = data_func_factory(lambda idx: target_datas[idx], source_orders)
+    raw_src_datas: Dict[str, str] = {}
+    for line in kaldi_io.open_or_fd(file_path):
+        key, rxfile = line.decode().split(' ')
+        raw_src_datas[key] = rxfile
+
+    get_src_data = get_src_data_factory(raw_src_datas)
+
+    targets = list(targets)
+    instances_before_filtering = len(targets)
+
+    targets = list(filter(lambda fields: fields[2].strip(), targets))
+
+    orders = [i for i, fields in enumerate(targets) if
+        all(utt_id in raw_src_datas for utt_id in fields[0])]
+
+    dropped_instances = instances_before_filtering - len(targets)
+    if not dropped_instances:
+        logger.info("No instances dropped from {}.".format(file_path))
+    else:
+        logger.warning("Dropped {} instances from {}.".format(dropped_instances,
+                                                              file_path))
+
+    # for utt_ids, src_trns, *tgt_trns in tqdm(targets):
+    #     utt_datas = []
+    #     source_data = get_src_data(utt_ids)
+    #     source_datas.append(source_data)
+    #     target_datas.append(tgt_trns[0])
+
+    # src_lens = [src.shape[0] for src in source_datas]
+    # source_orders = np.argsort(src_lens)
+    src_data_func = data_func_factory(lambda idx: get_src_data(targets[idx][0]), orders)
+    tgt_data_func = data_func_factory(lambda idx: targets[idx][2], orders)
 
     annotations = None
     if dep:
-        annotations = read_dependencies(file_path)
+        annotations = read_dependencies(os.path.dirname(file_path))
 
     anno_data_func = data_func_factory(lambda idx: annotations[idx] if annotations else None,
-                                       source_orders)
+                                       orders)
 
-    return src_data_func, tgt_data_func, anno_data_func, len(source_orders)
+    return src_data_func, tgt_data_func, anno_data_func, len(orders)
 
 def flatten(l):
     return [item for sublist in l for item in sublist]
@@ -336,7 +363,6 @@ class SpeechToTextDatasetReader(DatasetReader):
 
         if target_string is not None:
             target = self._target_tokenizer.tokenize(target_string)
-
             target_field = TextField(target,
                                      self._target_token_indexers)
 
@@ -347,9 +373,14 @@ class SpeechToTextDatasetReader(DatasetReader):
             if self._dep and annotation is not None:
                 heads, tags, words, pos_tags = annotation
                 dep_fields = self._text_to_dep_fields(words, pos_tags, list(zip(tags, heads)))
-                segments = [0] + flatten([[idx + 1] * len(word) for idx, word in enumerate(words)]) + [0]
-                fields["segments"] = SequenceLabelField(segments, target_field,
-                                                        label_namespace="segment_labels")
+                if self._word_level:
+                    target_field = TextField([Token(word) for word in words],
+                                             self._target_token_indexers)
+                    fields["target_tokens"] = target_field
+                else:
+                    segments = [0] + flatten([[idx + 1] * len(word) for idx, word in enumerate(words)]) + [0]
+                    fields["segments"] = SequenceLabelField(segments, target_field,
+                                                            label_namespace="segment_labels")
                 fields.update(dep_fields)
 
             return Instance(fields)

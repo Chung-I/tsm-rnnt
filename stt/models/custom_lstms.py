@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import Parameter
@@ -57,6 +58,30 @@ def script_lstm(input_size, hidden_size, num_layers, bias=True,
                       other_layer_args=[LSTMCell, hidden_size * dirs,
                                         hidden_size])
 
+def script_convlstm(input_channel, hidden_channel, kernel_size, hidden_size, num_layers,
+                    bias=True, batch_first=False, dropout=False, bidirectional=False,
+                    decompose_layernorm=False):
+    '''Returns a ScriptModule that mimics a PyTorch native LSTM.'''
+
+    # The following are not implemented.
+    assert bias
+    assert not batch_first
+    assert not dropout
+
+    if bidirectional:
+        stack_type = StackedLSTM2
+        layer_type = BidirLSTMLayer
+        dirs = 2
+    else:
+        stack_type = StackedLSTM
+        layer_type = LSTMLayer
+        dirs = 1
+
+    return stack_type(num_layers, layer_type,
+                      first_layer_args=[ConvLSTMCell, input_channel, hidden_channel,
+                                        kernel_size, hidden_size],
+                      other_layer_args=[ConvLSTMCell, input_channel, hidden_channel,
+                                        kernel_size, hidden_size])
 
 def script_lnlstm(input_size, hidden_size, num_layers, bias=True,
                   batch_first=False, dropout=False, bidirectional=False,
@@ -89,8 +114,54 @@ LSTMState = namedtuple('LSTMState', ['hx', 'cx'])
 
 def reverse(lst):
     # type: (List[Tensor]) -> List[Tensor]
-    return lst[::-1]
+    outputs = jit.annotate(List[Tensor], [])
+    for tensor in reversed(lst):
+        outputs.append(tensor)
+    return outputs
 
+class ConvLSTMCell(jit.ScriptModule):
+    def __init__(self, input_channels, hidden_channels, kernel_size, hidden_size):
+        super(ConvLSTMCell, self).__init__()
+
+        assert hidden_channels % 2 == 0
+
+        self.input_channels = torch.jit.Attribute(input_channels, int)
+        self.hidden_channels = torch.jit.Attribute(hidden_channels, int)
+        self.hidden_size = torch.jit.Attribute(hidden_size, int)
+        self.kernel_size = torch.jit.Attribute(kernel_size, List[int])
+
+        padding = list(((np.array(kernel_size) - 1) // 2))
+        self.padding = torch.jit.Attribute(padding, List[int])
+
+        self.input_linearity = torch.nn.Conv2d(self.input_channels, self.hidden_channels * 4,
+                                               self.kernel_size, 1, self.padding, bias=False)
+        self.state_linearity = torch.nn.Conv2d(self.hidden_channels, self.hidden_channels * 4,
+                                               self.kernel_size, 1, self.padding, bias=True)
+
+        self.Wci = torch.nn.Parameter(torch.zeros((1, self.hidden_channels, 1, self.hidden_size)))
+        self.Wcf = torch.nn.Parameter(torch.zeros((1, self.hidden_channels, 1, self.hidden_size)))
+        self.Wco = torch.nn.Parameter(torch.zeros((1, self.hidden_channels, 1, self.hidden_size)))
+
+    @jit.script_method
+    def forward(self, input, state):
+        # type: (Tensor, Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tuple[Tensor, Tensor]]
+        hx, cx = state
+
+        batch_size, input_size = input.size()
+        input = input.reshape(batch_size, self.input_channels, 1, self.hidden_size)
+        hx = hx.reshape(batch_size, self.hidden_channels, 1, self.hidden_size)
+        cx = cx.reshape(batch_size, self.hidden_channels, 1, self.hidden_size)
+        gates = self.input_linearity(input) + self.state_linearity(hx)
+        ingate, forgetgate, cellgate, outgate = gates.chunk(4, 1)
+        ingate = torch.sigmoid(ingate + cx * self.Wci)
+        forgetgate = torch.sigmoid(forgetgate + cx * self.Wcf)
+        cellgate = torch.tanh(cellgate)
+        cy = (forgetgate * cx) + (ingate * cellgate)
+        outgate = torch.sigmoid(outgate + cy * self.Wco)
+        hy = outgate * torch.tanh(cy)
+        hy = hy.reshape(batch_size, input_size)
+        cy = cy.reshape(batch_size, input_size)
+        return hy, (hy, cy)
 
 class LSTMCell(jit.ScriptModule):
     def __init__(self, input_size, hidden_size):
@@ -226,12 +297,14 @@ class ReverseLSTMLayer(jit.ScriptModule):
     @jit.script_method
     def forward(self, input, state):
         # type: (Tensor, Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tuple[Tensor, Tensor]]
-        inputs = reverse(input.unbind(0))
+        inputs = torch.split(input, 1)
+        inputs.reverse()
         outputs = jit.annotate(List[Tensor], [])
         for i in range(len(inputs)):
             out, state = self.cell(inputs[i], state)
             outputs += [out]
-        return torch.stack(reverse(outputs)), state
+        outputs.reverse()
+        return torch.stack(outputs), state
 
 
 class BidirLSTMLayer(jit.ScriptModule):

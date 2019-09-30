@@ -1,13 +1,17 @@
 local BATCH_SIZE = 16;
 local FRAME_RATE = 1;
+local CORPUS = "fisher";
 local ENCODER_HIDDEN_SIZE = 512;
 local DECODER_HIDDEN_SIZE = 512;
-local VOCAB_PATH = "data/vocabulary/phn_level";
+local DEP = true;
+local POS = false;
+local TSM_VOCAB_PATH = "data/vocabulary/phn_level";
+local FISHER_VOCAB_PATH = "runs/fisher-vocab/vocabulary";
 local NUM_GPUS = 1;
 local CHAR_TARGET_NAMESPACE = "characters";
 local WORD_TARGET_NAMESPACE = "tokens";
 local PHN_TARGET_NAMESPACE = "phonemes";
-local WORD_LEVEL = false;
+local WORD_LEVEL = CORPUS != "tsm";
 local TARGET_NAMESPACE = if WORD_LEVEL then WORD_TARGET_NAMESPACE else CHAR_TARGET_NAMESPACE;
 local NUM_THREADS = 8;
 local VGG = true;
@@ -16,17 +20,16 @@ local OUT_CHANNEL = 32;
 local STACK_RATE = if VGG then std.pow(2, VGG_LAYERS)  else 1;
 local NUM_MELS = 80;
 local VGG_OUTPUT_SIZE = NUM_MELS * (if VGG then (OUT_CHANNEL / STACK_RATE) else 1) * FRAME_RATE;
-local DIRECTIONS = 1;
+local DIRECTIONS = 2;
 local SUMMARY_INTERVAL = 100;
 local ENCODER_OUTPUT_SIZE = ENCODER_HIDDEN_SIZE * DIRECTIONS;
-local CORPUS = "tsm";
 local OCD = false;
 local DELTA = 2;
 
 local PARSER = {
       "type": "biaffine_parser",
       "text_field_embedder": {
-        "tokens": {
+        [WORD_TARGET_NAMESPACE]: {
           "type": "pass_through",
           "hidden_dim": ENCODER_OUTPUT_SIZE
         }
@@ -41,15 +44,15 @@ local PARSER = {
       "dropout": 0.3,
       "input_dropout": 0.3,
       "initializer": [
-        #[".*projection.*weight", {"type": "xavier_uniform"}],
-        #[".*projection.*bias", {"type": "zero"}],
+        [".*projection.*weight", {"type": "xavier_uniform"}],
+        [".*projection.*bias", {"type": "zero"}],
         [".*tag_bilinear.*weight", {"type": "xavier_uniform"}],
         [".*tag_bilinear.*bias", {"type": "zero"}]
       ]
 };
 
 local TAGGER = {
-      "type": "crf_tagger",
+      "type": "simple_tagger",
       "text_field_embedder": {
         "tokens": {
           "type": "pass_through",
@@ -63,8 +66,8 @@ local TAGGER = {
       "label_namespace": "pos",
       "dropout": 0.3,
       "initializer": [
-        #[".*projection.*weight", {"type": "xavier_uniform"}],
-        #[".*projection.*bias", {"type": "zero"}],
+        [".*projection.*weight", {"type": "xavier_uniform"}],
+        [".*projection.*bias", {"type": "zero"}],
         [".*tag_bilinear.*weight", {"type": "xavier_uniform"}],
         [".*tag_bilinear.*bias", {"type": "zero"}]
       ]
@@ -84,12 +87,12 @@ local BASE_ITERATOR = {
 
 local TSM_READER = {
   "type": "mao-stt",
-  "word_level": false,
+  "word_level": WORD_LEVEL,
   "lazy": true,
   "mmap": true,
   "online": false,
   "discard_energy_dim": true,
-  #"dep": true,
+  "dep": DEP,
   "lexicon_path": "/home/nlpmaster/lexicon.txt",
   "shard_size": BATCH_SIZE,
   "input_stack_rate": FRAME_RATE,
@@ -125,8 +128,9 @@ local FISHER_READER = {
   "lazy": true,
   "mmap": true,
   "online": false,
+  "word_level": WORD_LEVEL,
   "discard_energy_dim": true,
-  "dep": false,
+  "dep": DEP,
   "lexicon_path": "/home/nlpmaster/lexicon.txt",
   "fisher_ch": ["/home/nlpmaster/Corpora/fisher_ch/fisher_ch_spa-eng/data", "fisher", "train"],
   "shard_size": BATCH_SIZE,
@@ -139,13 +143,19 @@ local FISHER_READER = {
   "target_tokenizer": {
     "type": "word",
     "word_splitter": {
-      "type": "just_spaces"
-    }
+      "type": "spacy"
+    },
+    // "word_filter": {
+    //   "type": "regex",
+    //   "patterns": ["^\\W+$"],
+    // },
   },
   "target_token_indexers": {
     "tokens": {
       "type": "single_id",        
-      "namespace": WORD_TARGET_NAMESPACE
+      "namespace": TARGET_NAMESPACE,
+      "start_tokens": ["@start@"],
+      "end_tokens": ["@end@"],
     }
   }
 };
@@ -186,10 +196,10 @@ local PTS_READER = {
   // "random_seed": 13370,
   // "numpy_seed": 1337,
   // "pytorch_seed": 133,
-  // "dataset_reader": FISHER_READER,
-  // "validation_dataset_reader": VALID_FISHER_READER,
-  "dataset_reader": TSM_READER,
-  "validation_dataset_reader": VALID_TSM_READER,
+  "dataset_reader": if CORPUS == "tsm" then TSM_READER else FISHER_READER,
+  "validation_dataset_reader": if CORPUS == "tsm" then VALID_TSM_READER else VALID_FISHER_READER,
+  // "dataset_reader": TSM_READER,
+  // "validation_dataset_reader": VALID_TSM_READER,
   // "dataset_reader": {
   //     "type": "interleaving",
   //     "readers": {
@@ -205,7 +215,7 @@ local PTS_READER = {
   //     "lazy": true
   // },
   "vocabulary": {
-    "directory_path": VOCAB_PATH
+    "directory_path": if CORPUS == "tsm" then TSM_VOCAB_PATH else FISHER_VOCAB_PATH,
   },
   // "train_data_path": |||
   //   {
@@ -217,25 +227,27 @@ local PTS_READER = {
   //       "tokens": "/home/nlpmaster/ssd-1t/corpus/TSM/valids"
   //   }
   // |||,
-  "train_data_path": "/home/nlpmaster/ssd-1t/corpus/TSM/trains",
-  "validation_data_path": "/home/nlpmaster/ssd-1t/corpus/TSM/valids",
-  // "train_data_path": "/home/nlpmaster/Works/egs/fisher_callhome_spanish/s5/data/train/feats.scp",
-  // "validation_data_path": "/home/nlpmaster/Works/egs/fisher_callhome_spanish/s5/data/*dev*/feats.scp",
+  // "train_data_path": ,
+  // "validation_data_path": ,
+  "train_data_path": if CORPUS == "tsm" then "/home/nlpmaster/ssd-1t/corpus/TSM/trains"
+    else "/home/nlpmaster/Works/egs/fisher_callhome_spanish/s5/data/train/feats.scp",
+  "validation_data_path": if CORPUS == "tsm" then "/home/nlpmaster/ssd-1t/corpus/TSM/valids"
+    else "/home/nlpmaster/Works/egs/fisher_callhome_spanish/s5/data/dev/feats.scp",
   "model": {
     "type": "phn_mocha",
     "input_size": NUM_MELS * FRAME_RATE,
-    "cmvn": 'none',
+    "cmvn": 'utt',
     "from_candidates": false,
     "sampling_strategy": if OCD then "sample" else "max",
     "max_decoding_ratio": 1.0,
-    "dep_ratio": 0.0,
+    "dep_ratio": 0.1,
     "pos_ratio": 0.0,
-    "time_mask_width": 5,
-    "freq_mask_width": 5,
-    "time_mask_max_ratio": 0.1,
+    "time_mask_width": 0,
+    "freq_mask_width": 0,
+    "time_mask_max_ratio": 0.0,
     "delta": DELTA,
-    // "dep_parser": PARSER,
-    // "pos_tagger": TAGGER,
+    "dep_parser": if DEP then PARSER else null,
+    "pos_tagger": if (DEP && POS) then TAGGER else null,
     // "encoder": {
     //   "type": "awd-rnn",
     //   "input_size": NUM_MELS * FRAME_RATE,
@@ -247,7 +259,7 @@ local PTS_READER = {
     //   "wdrop": 0.0,
     //   "stack_rates": [2, 2],
     // },
-    "att_ratio": 0.5,
+    "att_ratio": 0.9,
     "encoder": {
       "type": "lstm",
       "input_size": VGG_OUTPUT_SIZE,
@@ -255,39 +267,39 @@ local PTS_READER = {
       "num_layers": 4,
       "bidirectional": (DIRECTIONS == 2)
     },
-    "ctc_layer": {
-      "type": "ctc",
-      "target_namespace": TARGET_NAMESPACE,
-      "loss_ratio": 0.25
-    },
-    "projection_layer": {
-      "_pretrained": {
-        "archive_file": "runs/ctc/model.tar.gz",
-        "module_path": "_joint_ctc_projection_layer",
-        "freeze": false
-      }
-    },
-    "rnnt_layer": {
-      "type": "rnnt",
-      "input_size": ENCODER_OUTPUT_SIZE,
-      "hidden_size": DECODER_HIDDEN_SIZE,
-      "target_namespace": TARGET_NAMESPACE,
-      "loss_ratio": 0.25,
-      "recurrency": {
-        "_pretrained": {
-          "archive_file": "runs/lm/model.tar.gz",
-          "module_path": "_contextualizer._module",
-          "freeze": false
-        }
-      },
-      "target_embedder": {
-        "_pretrained": {
-          "archive_file": "runs/lm/model.tar.gz",
-          "module_path": "_text_field_embedder.token_embedder_tokens",
-          "freeze": false
-        }
-      }
-    },
+    // "ctc_layer": {
+    //   "type": "ctc",
+    //   "target_namespace": TARGET_NAMESPACE,
+    //   "loss_ratio": 0.25
+    // },
+    // "projection_layer": {
+    //   "_pretrained": {
+    //     "archive_file": "runs/ctc/model.tar.gz",
+    //     "module_path": "_joint_ctc_projection_layer",
+    //     "freeze": false
+    //   }
+    // },
+    // "rnnt_layer": {
+    //   "type": "rnnt",
+    //   "input_size": ENCODER_OUTPUT_SIZE,
+    //   "hidden_size": DECODER_HIDDEN_SIZE,
+    //   "target_namespace": TARGET_NAMESPACE,
+    //   "loss_ratio": 0.25,
+    //   "recurrency": {
+    //     "_pretrained": {
+    //       "archive_file": "runs/lm/model.tar.gz",
+    //       "module_path": "_contextualizer._module",
+    //       "freeze": false
+    //     }
+    //   },
+    //   "target_embedder": {
+    //     "_pretrained": {
+    //       "archive_file": "runs/lm/model.tar.gz",
+    //       "module_path": "_text_field_embedder.token_embedder_tokens",
+    //       "freeze": false
+    //     }
+    //   }
+    // },
     // "encoder": {
     //   "_pretrained": {
     //     "archive_file": "runs/ctc/model.tar.gz",
@@ -308,7 +320,8 @@ local PTS_READER = {
     //   "input_size": VGG_OUTPUT_SIZE,
     //   "hidden_size": ENCODER_HIDDEN_SIZE,
     //   "num_layers": 4,
-    //   "layer_norm": true
+    //   "layer_norm": true,
+    //   "bidirectional": (DIRECTIONS == 2)
     // },
     "dec_layers": 1,
     "cnn": {
@@ -318,6 +331,17 @@ local PTS_READER = {
       "hidden_channel": OUT_CHANNEL,
       "nonlinearity": "relu"
     },
+    // "conv_lstm": {
+    //   "type": "stacked_custom_lstm",
+    //   "conv": true,
+    //   "input_channel": OUT_CHANNEL,
+    //   "hidden_channel": OUT_CHANNEL,
+    //   "input_size": NUM_MELS / STACK_RATE,
+    //   "hidden_size": NUM_MELS / STACK_RATE,
+    //   "kernel_size": [1, 3],
+    //   "num_layers": 1,
+    //   "bidirectional": (DIRECTIONS == 2)
+    // },
     // "cnn": {
     //   "_pretrained": {
     //     "archive_file": "runs/ctc/model.tar.gz",
@@ -357,11 +381,11 @@ local PTS_READER = {
       [".*weight_hh.*", {"type": "orthogonal"}],
       [".*bias_ih.*", {"type": "zero"}],
       [".*bias_hh.*", {"type": "lstm_hidden_bias"}],
-      #["_target_embedder.weight", {"type": "uniform", "a": -1, "b": 1}],
+      ["_target_embedder.weight", {"type": "uniform", "a": -1, "b": 1}]
       #["_target_embedder.weight", "prevent"],
     ]
   },
-  "iterator": BASE_ITERATOR + {"instances_per_epoch": 1280000},
+  "iterator": BASE_ITERATOR,// + {"instances_per_epoch": 1280},
   "validation_iterator": BASE_ITERATOR,
   // "iterator": {
   //   "type": "multiprocess",
@@ -376,7 +400,7 @@ local PTS_READER = {
     "patience": 20,
     "grad_norm": 2.0,
     "cuda_device": 0,
-    "validation_metric": "-rnnt_wer",
+    "validation_metric": "-att_wer",
     "num_serialized_models_to_keep": 1,
     "should_log_learning_rate": true,
     // "learning_rate_scheduler": {

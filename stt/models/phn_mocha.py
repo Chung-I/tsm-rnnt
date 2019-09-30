@@ -95,14 +95,14 @@ class PhnMoChA(Model):
                  dep_parser: Model = None,
                  pos_tagger: Model = None,
                  cmvn: str = 'none',
-                 delta: bool = False,
-                 acceleration: bool = False,
+                 delta: int = 0,
                  time_mask_width: int = 0,
                  freq_mask_width: int = 0,
                  time_mask_max_ratio: float = 0.0,
                  dec_layers: int = 1,
                  layerwise_pretraining: List[Tuple[int, int]] = None,
                  cnn: Seq2SeqEncoder = None,
+                 conv_lstm: Seq2SeqEncoder = None,
                  train_at_phn_level: bool = False,
                  rnnt_layer: Model = None,
                  phn_ctc_layer: Model = None,
@@ -182,6 +182,7 @@ class PhnMoChA(Model):
         self._encoder = encoder
 
         self._cnn = cnn
+        self._conv_lstm = conv_lstm
 
         num_classes = self.vocab.get_vocab_size(self._target_namespace)
         self._num_classes = num_classes
@@ -234,18 +235,13 @@ class PhnMoChA(Model):
 
         self._input_norm = lambda x: x
         if cmvn == 'global':
-            self._input_norm = nn.BatchNorm1d(self._input_size)
+            self._input_norm = nn.BatchNorm1d(self._input_size * (delta + 1))
         elif cmvn == 'utt':
-            self._input_norm = nn.InstanceNorm1d(self._input_size)
+            self._input_norm = nn.InstanceNorm1d(self._input_size * (delta + 1))
 
         self._delta = None
-        if delta:
-            raise NotImplementedError
-            # self._delta = Delta(order=1)
-        self._acceleration = None
-        if acceleration:
-            raise NotImplementedError
-            # self._acceleration = Delta(order=2)
+        if delta > 0:
+            self._delta = Delta(order=delta)
 
         self._epoch_num = float("inf")
         self._layerwise_pretraining = layerwise_pretraining
@@ -359,13 +355,20 @@ class PhnMoChA(Model):
 
         source_mask = util.get_mask_from_sequence_lengths(source_lengths,
                                                           source_features.size(1)).bool()
+
+        source_features = source_features.unsqueeze(1) # make a channel dim
+        if self._delta:
+            source_features = self._delta(source_features)
+
+        batch_size, n_channels, timesteps, feature_size = source_features.size()
         source_features = self._input_norm(
-            source_features.transpose(-2, -1)).transpose(-2, -1)
+            source_features.transpose(-2, -1).reshape(batch_size, -1, timesteps)) \
+            .view(batch_size, n_channels, feature_size, timesteps).transpose(-2, -1)
         source_features = self.time_mask(source_features, source_mask)
         source_features = self.freq_mask(source_features, source_mask)
 
         source_features = source_features.masked_fill(
-            ~source_mask.unsqueeze(-1).expand_as(source_features), 0.0)
+            ~source_mask.unsqueeze(1).unsqueeze(-1).expand_as(source_features), 0.0)
         state = self._encode(source_features, source_lengths)
         source_lengths = util.get_lengths_from_binary_sequence_mask(state["source_mask"])
         target_tokens["mask"] = (target_tokens[self._target_namespace] != self._pad_index).bool()
@@ -437,8 +440,8 @@ class PhnMoChA(Model):
 
         if self.training:
             output_dict = self._collect_losses(output_dict,
-                                               ctc=self._ctc_layer.loss_ratio,
-                                               rnnt=self._rnnt_layer.loss_ratio,
+                                               ctc=(self._ctc_layer.loss_ratio if self._ctc_layer else 0),
+                                               rnnt=(self._rnnt_layer.loss_ratio if self._rnnt_layer else 0),
                                                att=self._att_ratio,
                                                dal=self._latency_penalty,
                                                dep=self._dep_ratio,
@@ -495,9 +498,11 @@ class PhnMoChA(Model):
         if self._cnn is not None:
             source_features, source_lengths = self._cnn(
                 source_features, source_lengths)
+        source_mask = util.get_mask_from_sequence_lengths(
+            source_lengths, source_features.size(1))
+        if self._conv_lstm is not None:
+            source_features = self._conv_lstm(source_features, source_mask)
         if not isinstance(self._encoder, AWDRNN):
-            source_mask = util.get_mask_from_sequence_lengths(
-                source_lengths, source_features.size(1))
             encoder_outputs = self._encoder(source_features, source_mask)
         else:
             encoder_outputs, _, source_lengths = self._encoder(

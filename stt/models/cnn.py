@@ -81,8 +81,7 @@ class VGGExtractor(nn.Module):
     def forward(self, feature, lengths):
         # pylint: disable=arguments-differ
         # Feature shape BSxTxD -> BS x CH(num of delta) x T x D(acoustic feature dim)
-        batch_size, _, feat_dim = feature.size()
-        feature = feature.unsqueeze(1)
+        batch_size, _, _, feat_dim = feature.size()
         feature, lengths = self.conv1(feature, lengths)
         feature = F.relu(feature)
         feature, lengths = self.conv2(feature, lengths)
@@ -117,7 +116,9 @@ class CNN(Seq2SeqEncoder):
             conv = LengthAwareWrapper(nn.Conv2d(in_channel, self._hidden_channel,
                                                 self._kernel_size, stride=self._stride,
                                                 padding=1))
+            bn = LengthAwareWrapper(nn.BatchNorm2d(self._hidden_channel), pass_through=True)
             layers.append((f"conv{l}", conv))
+            layers.append((f"bn{l}", bn))
             layers.append((f"nonlinear{l}", LengthAwareWrapper(nonlinearity, pass_through=True)))
         self.module = nn.Sequential(OrderedDict(layers))
         strides = [self.module[idx].stride for idx in range(len(self.module))
@@ -139,11 +140,8 @@ class CNN(Seq2SeqEncoder):
     @overrides
     def forward(self, feature, lengths):
         # Feature shape BSxTxD -> BS x CH(num of delta) x T x D(acoustic feature dim)
-        batch_size, _, feat_dim = feature.size()
-        feature = feature.unsqueeze(1)
+        batch_size, _, _, feat_dim = feature.size()
         feature, lengths = self.module((feature, lengths))
-        feature = feature.transpose(1, 2)
-        #  BS x T/4 x 64 x D/4 -> BS x T/4 x 16D
-        feature = feature.reshape(
-            batch_size, -1, feat_dim * self._hidden_channel // self._downsample_rate)
+        batch_size, _, timesteps, _ = feature.size()
+        feature = feature.permute(0, 2, 1, 3).reshape(batch_size, timesteps, -1)
         return feature, lengths

@@ -10,7 +10,7 @@ from allennlp.common.checks import ConfigurationError
 from allennlp.modules.seq2seq_encoders.seq2seq_encoder import Seq2SeqEncoder
 from allennlp.modules.seq2seq_encoders import _Seq2SeqWrapper
 
-from stt.models.custom_lstms import script_lstm, script_lnlstm
+from stt.models.custom_lstms import script_lstm, script_lnlstm, script_convlstm
 
 class StackedCustomLstm(torch.nn.Module):
     """
@@ -48,15 +48,29 @@ class StackedCustomLstm(torch.nn.Module):
                  input_size: int,
                  hidden_size: int,
                  num_layers: int,
+                 bidirectional: bool = False,
+                 conv: bool = False,
+                 input_channel: int = None,
+                 hidden_channel: int = None,
+                 kernel_size: Union[Tuple[int], int] = None,
                  layer_norm: bool = False) -> None:
         super(StackedCustomLstm, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
+        self.hidden_channel = hidden_channel
         self.num_layers = num_layers
+        self.conv = conv
+        self.bidirectional = bidirectional
+
         if layer_norm:
-            self.rnn = script_lnlstm(input_size, hidden_size, num_layers)
+            self.rnn = script_lnlstm(input_size, hidden_size, num_layers,
+                                     bidirectional=bidirectional)
+        elif conv:
+            self.rnn = script_convlstm(input_channel, hidden_channel, kernel_size, input_size,
+                                       num_layers, bidirectional=bidirectional)
         else:
-            self.rnn = script_lstm(input_size, hidden_size, num_layers)
+            self.rnn = script_lstm(input_size, hidden_size, num_layers,
+                                   bidirectional=bidirectional)
 
     def forward(self,  # pylint: disable=arguments-differ
                 inputs: PackedSequence,
@@ -79,11 +93,18 @@ class StackedCustomLstm(torch.nn.Module):
             The per-layer final (state, memory) states of the LSTM, each with shape
             (num_layers, batch_size, hidden_size).
         """
+        def init_hidden(tensor, shape):
+            return (tensor.new_zeros(shape),
+                    tensor.new_zeros(shape))
+
         sequence_tensor, batch_lengths = pad_packed_sequence(inputs, batch_first=True)
         batch_size, _, _ = sequence_tensor.size()
+        hidden_shape = torch.Size((batch_size, self.hidden_channel * self.hidden_size)) if self.conv \
+            else torch.Size((batch_size, self.hidden_size))
+
         if not initial_state:
-            hidden_states = [(sequence_tensor.new_zeros(batch_size, self.hidden_size),
-                              sequence_tensor.new_zeros(batch_size, self.hidden_size))
+            hidden_states = [[init_hidden(sequence_tensor, hidden_shape) for _ in range(2)] if self.bidirectional
+                             else init_hidden(sequence_tensor, hidden_shape)
                              for _ in range(self.num_layers)]
         elif initial_state[0].size()[0] != self.num_layers:
             raise ConfigurationError("Initial states were passed to forward() but the number of "

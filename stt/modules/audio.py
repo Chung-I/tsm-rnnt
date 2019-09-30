@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+import math
 
 class Delta(torch.jit.ScriptModule):
 
@@ -48,6 +49,55 @@ class Delta(torch.jit.ScriptModule):
             scales[i] = [0] * padding + scale + [0] * padding
 
         return torch.Tensor(scales).unsqueeze(1).unsqueeze(1)
+
+    def savgol_coeffs(self, window_length, polyorder, deriv=0, delta=1.0, pos=None,
+                      use="conv"):
+        if polyorder >= window_length:
+            raise ValueError("polyorder must be less than window_length.")
+
+        halflen, rem = divmod(window_length, 2)
+
+        if rem == 0:
+            raise ValueError("window_length must be odd.")
+
+        if pos is None:
+            pos = halflen
+
+        if not (0 <= pos < window_length):
+            raise ValueError("pos must be nonnegative and less than "
+                            "window_length.")
+
+        if use not in ['conv', 'dot']:
+            raise ValueError("`use` must be 'conv' or 'dot'")
+
+        # Form the design matrix A.  The columns of A are powers of the integers
+        # from -pos to window_length - pos - 1.  The powers (i.e. rows) range
+        # from 0 to polyorder.  (That is, A is a vandermonde matrix, but not
+        # necessarily square.)
+        x = torch.arange(-pos, window_length - pos, dtype=torch.float32)
+        if use == "conv":
+            # Reverse so that result can be used in a convolution.
+            x = x[::-1]
+
+        order = torch.arange(polyorder + 1).reshape(-1, 1)
+        if order.size == 1:
+            raise NotImplementedError
+            # Avoid spurious DeprecationWarning in numpy 1.8.0 for
+            # ``[1] ** [[2]]``, see numpy gh-4145.
+            # A = np.atleast_2d(x ** order[0, 0])
+        else:
+            A = x ** order
+
+        # y determines which order derivative is returned.
+        y = torch.zeros(polyorder + 1)
+        # The coefficient assigned to y[deriv] scales the result to take into
+        # account the order of the derivative and the sample spacing.
+        y[deriv] = math.factorial(deriv) / (delta ** deriv)
+
+        # Find the least-squares solution of A*c = y
+        coeffs, _ = torch.lstsq(y, A)
+
+        return coeffs
 
     def extra_repr(self):
         return "order={}, window_size={}".format(self.order, self.window_size)

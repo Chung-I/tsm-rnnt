@@ -10,6 +10,7 @@ from typing import Dict, Optional, List, Tuple, Union, Iterable, Any, NamedTuple
 
 import torch
 import torch.optim.lr_scheduler
+from apex import amp
 
 from allennlp.common import Params
 from allennlp.common.checks import ConfigurationError, parse_cuda_device
@@ -62,7 +63,8 @@ class SloppyTrainer(TrainerBase):
                  should_log_parameter_statistics: bool = True,
                  should_log_learning_rate: bool = False,
                  log_batch_size_period: Optional[int] = None,
-                 moving_average: Optional[MovingAverage] = None) -> None:
+                 moving_average: Optional[MovingAverage] = None,
+                 mixed_precision: bool = False) -> None:
         """
         A trainer for doing supervised learning. It just takes a labeled dataset
         and a ``DataIterator``, and uses the supplied ``Optimizer`` to learn the weights
@@ -224,6 +226,10 @@ class SloppyTrainer(TrainerBase):
         self._learning_rate_scheduler = learning_rate_scheduler
         self._momentum_scheduler = momentum_scheduler
         self._moving_average = moving_average
+        self._mixed_precision = mixed_precision
+
+        if self._mixed_precision:
+            self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level="O1")
 
         # We keep the total batch number as an instance variable because it
         # is used inside a closure for the hook which logs activations in
@@ -328,7 +334,11 @@ class SloppyTrainer(TrainerBase):
                 self.optimizer.zero_grad()
                 continue
 
-            loss.backward()
+            if self._mixed_precision:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
 
             train_loss += loss.item()
 
@@ -617,6 +627,8 @@ class SloppyTrainer(TrainerBase):
         if self._momentum_scheduler is not None:
             training_states["momentum_scheduler"] = self._momentum_scheduler.state_dict(
             )
+        if self._mixed_precision:
+            training_states["amp"] = amp.state_dict()
 
         self._checkpointer.save_checkpoint(
             model_state=self.model.state_dict(),
@@ -660,6 +672,8 @@ class SloppyTrainer(TrainerBase):
         if self._momentum_scheduler is not None and "momentum_scheduler" in training_state:
             self._momentum_scheduler.load_state_dict(
                 training_state["momentum_scheduler"])
+        if self._mixed_precision:
+            amp.load_state_dict(training_state["amp"])
         training_util.move_optimizer_to_cuda(self.optimizer)
 
         # Currently the ``training_state`` contains a serialized ``MetricTracker``.
@@ -773,6 +787,7 @@ class SloppyTrainer(TrainerBase):
         should_log_learning_rate = params.pop_bool(
             "should_log_learning_rate", False)
         log_batch_size_period = params.pop_int("log_batch_size_period", None)
+        mixed_precision = params.pop_bool("mixed_precision", False)
 
         params.assert_empty(cls.__name__)
         return cls(model, optimizer, iterator,
@@ -795,4 +810,5 @@ class SloppyTrainer(TrainerBase):
                    should_log_parameter_statistics=should_log_parameter_statistics,
                    should_log_learning_rate=should_log_learning_rate,
                    log_batch_size_period=log_batch_size_period,
-                   moving_average=moving_average)
+                   moving_average=moving_average,
+                   mixed_precision=mixed_precision)

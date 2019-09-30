@@ -30,7 +30,8 @@ class TimeMask(nn.Module):
             if not self._replace_with_zero:
                 raise NotImplementedError
 
-            tensor = tensor.masked_fill(time_mask.unsqueeze(-1).expand_as(tensor),
+            tensor = tensor.masked_fill(time_mask.unsqueeze(1).unsqueeze(-1) \
+                                        .expand_as(tensor),
                                         replaced_value)
 
         return tensor
@@ -58,7 +59,7 @@ class FreqMask(nn.Module):
             if not self._replace_with_zero:
                 raise NotImplementedError
 
-            tensor = tensor.masked_fill(freq_mask.view(1, 1, -1).expand_as(tensor),
+            tensor = tensor.masked_fill(freq_mask.view(1, 1, 1, -1).expand_as(tensor),
                                         replaced_value)
 
         return tensor
