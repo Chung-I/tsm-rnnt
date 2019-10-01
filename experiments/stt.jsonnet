@@ -1,6 +1,9 @@
 local BATCH_SIZE = 16;
 local FRAME_RATE = 1;
 local CORPUS = "fisher";
+local CHAR = false;
+local WORD_LEVEL = CORPUS != "tsm" && !CHAR;
+local TARGET_EMBEDDING_DIM = if CORPUS == "fisher" && CHAR then 64 else 512;
 local ENCODER_HIDDEN_SIZE = 512;
 local DECODER_HIDDEN_SIZE = 512;
 local DEP = false;
@@ -11,9 +14,8 @@ local NUM_GPUS = 1;
 local CHAR_TARGET_NAMESPACE = "characters";
 local WORD_TARGET_NAMESPACE = "tokens";
 local PHN_TARGET_NAMESPACE = "phonemes";
-local WORD_LEVEL = CORPUS != "tsm";
 local TARGET_NAMESPACE = if WORD_LEVEL then WORD_TARGET_NAMESPACE else CHAR_TARGET_NAMESPACE;
-local NUM_THREADS = 8;
+local NUM_THREADS = 1;
 local VGG = true;
 local VGG_LAYERS = 2;
 local OUT_CHANNEL = 32;
@@ -85,6 +87,14 @@ local BASE_ITERATOR = {
   "track_epoch": true,
 };
 
+local ITERATOR = if NUM_THREADS < 1 then BASE_ITERATOR else
+{
+  "type": "multiprocess",
+  "base_iterator": BASE_ITERATOR, # + {"instances_per_epoch": 1280000},
+  "num_workers": NUM_THREADS,
+  "output_queue_size": 1024
+};
+
 local TSM_READER = {
   "type": "mao-stt",
   "word_level": WORD_LEVEL,
@@ -131,8 +141,8 @@ local FISHER_READER = {
   "online": false,
   "word_level": WORD_LEVEL,
   "discard_energy_dim": true,
-  "dep": DEP,
-  "lexicon_path": std.extVar("LEXICON_PATH"), 
+  "dep": true,
+  #"lexicon_path": std.extVar("LEXICON_PATH"), 
   "fisher_ch": [std.extVar("FISHER_PATH"), "fisher", "train"],
   "shard_size": BATCH_SIZE,
   "input_stack_rate": FRAME_RATE,
@@ -144,7 +154,7 @@ local FISHER_READER = {
   "target_tokenizer": {
     "type": "word",
     "word_splitter": {
-      "type": "spacy"
+      "type": "just_spaces"
     },
     // "word_filter": {
     //   "type": "regex",
@@ -157,6 +167,14 @@ local FISHER_READER = {
       "namespace": TARGET_NAMESPACE,
       "start_tokens": ["@start@"],
       "end_tokens": ["@end@"],
+      "lowercase_tokens": true,
+    },
+    "characters": {
+      "type": "just-characters",
+      "namespace": CHAR_TARGET_NAMESPACE,
+      "start_tokens": ["@start@"],
+      "end_tokens": ["@end@"],
+      "lowercase_tokens": true
     }
   }
 };
@@ -193,12 +211,20 @@ local PTS_READER = {
   }
 };
 
+local BASE_READER = if CORPUS == "tsm" then TSM_READER else FISHER_READER;
+local VAL_BASE_READER = if CORPUS == "tsm" then VALID_TSM_READER else VALID_FISHER_READER;
+
 {
   // "random_seed": 13370,
   // "numpy_seed": 1337,
   // "pytorch_seed": 133,
-  "dataset_reader": if CORPUS == "tsm" then TSM_READER else FISHER_READER,
-  "validation_dataset_reader": if CORPUS == "tsm" then VALID_TSM_READER else VALID_FISHER_READER,
+  "dataset_reader": if NUM_THREADS < 1 then BASE_READER else {
+    "type": "multiprocess",
+    "base_reader": BASE_READER,
+    "num_workers": NUM_THREADS,
+    "output_queue_size": 1024,
+  },
+  "validation_dataset_reader": VAL_BASE_READER,
   // "dataset_reader": TSM_READER,
   // "validation_dataset_reader": VALID_TSM_READER,
   // "dataset_reader": {
@@ -351,7 +377,7 @@ local PTS_READER = {
     //   }
     // },
     "max_decoding_steps": 30,
-    "target_embedding_dim": DECODER_HIDDEN_SIZE,
+    "target_embedding_dim": TARGET_EMBEDDING_DIM,
     "beam_size": 5,
     // "attention": {
     //   "type": "mocha",
@@ -386,14 +412,8 @@ local PTS_READER = {
       #["_target_embedder.weight", "prevent"],
     ]
   },
-  "iterator": BASE_ITERATOR,// + {"instances_per_epoch": 1280},
-  "validation_iterator": BASE_ITERATOR,
-  // "iterator": {
-  //   "type": "multiprocess",
-  //   "base_iterator": BASE_ITERATOR, # + {"instances_per_epoch": 1280000},
-  //   "num_workers": NUM_THREADS,
-  //   "output_queue_size": 1024
-  // },
+  "iterator": ITERATOR,// + {"instances_per_epoch": 1280},
+  "validation_iterator": ITERATOR,
   "trainer": {
     "type": "ignore_nan",
     #"mixed_precision": true,

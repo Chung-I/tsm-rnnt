@@ -319,7 +319,6 @@ class SpeechToTextDatasetReader(DatasetReader):
                             dependencies: List[Tuple[str, int]] = None) -> Instance:
 
         fields: Dict[str, Field] = {}
-
         tokens = [Token(t) for t in words]
 
         text_field = TextField(tokens, self._target_token_indexers)
@@ -372,6 +371,7 @@ class SpeechToTextDatasetReader(DatasetReader):
 
             if self._dep and annotation is not None:
                 heads, tags, words, pos_tags = annotation
+                assert words == [token.text for token in target]
                 dep_fields = self._text_to_dep_fields(words, pos_tags, list(zip(tags, heads)))
                 if self._word_level:
                     target_field = TextField([Token(word) for word in words],

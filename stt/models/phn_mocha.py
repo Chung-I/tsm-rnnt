@@ -344,8 +344,7 @@ class PhnMoChA(Model):
         -------
         Dict[str, torch.Tensor]
         """
-        import pdb
-        pdb.set_trace()
+        # print([self._indices_to_tokens(tokens.tolist()) for tokens in target_tokens[self._target_namespace]])
         output_dict = {}
         if dataset is not None:
             self._target_granularity = dataset[0]
@@ -456,6 +455,14 @@ class PhnMoChA(Model):
 
         return output_dict
 
+    def _indices_to_tokens(self, indices):
+        # Collect indices till the first end_symbol
+        if self._end_index in indices:
+            indices = indices[:indices.index(self._end_index)]
+        predicted_tokens = [self.vocab.get_token_from_index(x, namespace=self._target_namespace)
+                            for x in indices]
+        return predicted_tokens
+
     @overrides
     def decode(self, output_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -468,21 +475,14 @@ class PhnMoChA(Model):
         This method trims the output predictions to the first end symbol, replaces indices with
         corresponding tokens, and adds a field called ``predicted_tokens`` to the ``output_dict``.
         """
-        def _indices_to_tokens(indices):
-            # Collect indices till the first end_symbol
-            if self._end_index in indices:
-                indices = indices[:indices.index(self._end_index)]
-            predicted_tokens = [self.vocab.get_token_from_index(x, namespace=self._target_namespace)
-                                for x in indices]
-            return predicted_tokens
 
         def _decode_predictions(input_key: str, output_key: str, beam=False):
             if input_key in output_dict:
                 if beam:
-                    all_predicted_tokens = [list(map(_indices_to_tokens, beams)) 
+                    all_predicted_tokens = [list(map(self._indices_to_tokens, beams)) 
                                             for beams in sanitize(output_dict[input_key])]
                 else:
-                    all_predicted_tokens = list(map(_indices_to_tokens, sanitize(output_dict[input_key])))
+                    all_predicted_tokens = list(map(self._indices_to_tokens, sanitize(output_dict[input_key])))
                 output_dict[output_key] = all_predicted_tokens
 
         _decode_predictions("predictions", "predicted_tokens", beam=True)

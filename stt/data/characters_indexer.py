@@ -46,6 +46,7 @@ class CharactersIndexer(TokenIndexer[List[int]]):
                  start_tokens: List[str] = None,
                  end_tokens: List[str] = None,
                  min_padding_length: int = 0,
+                 lowercase_tokens: bool = False,
                  token_min_padding_length: int = 0) -> None:
         super().__init__(token_min_padding_length)
         if min_padding_length == 0:
@@ -58,6 +59,7 @@ class CharactersIndexer(TokenIndexer[List[int]]):
         self._min_padding_length = min_padding_length
         self._namespace = namespace
         self._character_tokenizer = character_tokenizer
+        self.lowercase_tokens = lowercase_tokens
 
         self._start_tokens = [Token(st) for st in (start_tokens or [])]
         self._end_tokens = [Token(et) for et in (end_tokens or [])]
@@ -69,8 +71,11 @@ class CharactersIndexer(TokenIndexer[List[int]]):
         for character in self._character_tokenizer.tokenize(token.text):
             # If `text_id` is set on the character token (e.g., if we're using byte encoding), we
             # will not be using the vocab for this character.
+            text = character.text
             if getattr(character, 'text_id', None) is None:
-                counter[self._namespace][character.text] += 1
+                if self.lowercase_tokens:
+                    text = text.lower()
+                counter[self._namespace][text] += 1
 
     @overrides
     def tokens_to_indices(self,
@@ -91,7 +96,10 @@ class CharactersIndexer(TokenIndexer[List[int]]):
                         # use this id instead.
                         index = character.text_id
                     else:
-                        index = vocabulary.get_token_index(character.text, self._namespace)
+                        text = character.text
+                        if self.lowercase_tokens:
+                            text = text.lower()
+                        index = vocabulary.get_token_index(text, self._namespace)
                     token_indices.append(index)
             indices += token_indices
         return {index_name: indices}
