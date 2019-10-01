@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.linear import Linear
-import warprnnt_pytorch
 
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import START_SYMBOL, END_SYMBOL, sanitize
@@ -345,6 +344,8 @@ class PhnMoChA(Model):
         -------
         Dict[str, torch.Tensor]
         """
+        import pdb
+        pdb.set_trace()
         output_dict = {}
         if dataset is not None:
             self._target_granularity = dataset[0]

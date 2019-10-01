@@ -126,3 +126,4 @@ runs
 /data
 path-train.sh
 demo.sh
+train.sh

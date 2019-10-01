@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.linear import Linear
 from torch.nn.modules.rnn import LSTMCell
-import warprnnt_pytorch
 
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import START_SYMBOL, END_SYMBOL, sanitize
@@ -234,6 +233,7 @@ class PhnMoChA(Model):
             self._joint_ctc_projection_layer = nn.Linear(self._encoder_output_dim,
                                                          self._num_classes)
             if  loss_type == 'rnnt':
+                import warprnnt_pytorch
                 self._joint_ctc_loss = warprnnt_pytorch.RNNTLoss(blank=self._pad_index,
                                                                  reduction='mean')
 

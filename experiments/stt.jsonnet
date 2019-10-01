@@ -3,10 +3,10 @@ local FRAME_RATE = 1;
 local CORPUS = "fisher";
 local ENCODER_HIDDEN_SIZE = 512;
 local DECODER_HIDDEN_SIZE = 512;
-local DEP = true;
+local DEP = false;
 local POS = false;
-local TSM_VOCAB_PATH = "data/vocabulary/phn_level";
-local FISHER_VOCAB_PATH = "runs/fisher-vocab/vocabulary";
+local TSM_VOCAB_PATH = std.extVar("TSM_VOCAB_PATH");
+local FISHER_VOCAB_PATH = std.extVar("FISHER_VOCAB_PATH");
 local NUM_GPUS = 1;
 local CHAR_TARGET_NAMESPACE = "characters";
 local WORD_TARGET_NAMESPACE = "tokens";
@@ -112,7 +112,8 @@ local TSM_READER = {
       "type": "single_id",        
       "namespace": WORD_TARGET_NAMESPACE,
       "start_tokens": ["@start@"],
-      "end_tokens": ["@end@"]
+      "end_tokens": ["@end@"],
+      "lowercase_tokens": true,
     },
     "characters": {
       "type": "just-characters",
@@ -131,8 +132,8 @@ local FISHER_READER = {
   "word_level": WORD_LEVEL,
   "discard_energy_dim": true,
   "dep": DEP,
-  "lexicon_path": "/home/nlpmaster/lexicon.txt",
-  "fisher_ch": ["/home/nlpmaster/Corpora/fisher_ch/fisher_ch_spa-eng/data", "fisher", "train"],
+  "lexicon_path": std.extVar("LEXICON_PATH"), 
+  "fisher_ch": [std.extVar("FISHER_PATH"), "fisher", "train"],
   "shard_size": BATCH_SIZE,
   "input_stack_rate": FRAME_RATE,
   "model_stack_rate": STACK_RATE,
@@ -166,7 +167,7 @@ local VALID_TSM_READER = TSM_READER + {
 
 local VALID_FISHER_READER = FISHER_READER + {
     "noskip": true,
-    "fisher_ch": ["/home/nlpmaster/Corpora/fisher_ch/fisher_ch_spa-eng/data", "fisher", "dev"]
+    "fisher_ch": [std.extVar("FISHER_PATH"), "fisher", "dev"]
 };
 
 local PTS_READER = {
@@ -229,10 +230,10 @@ local PTS_READER = {
   // |||,
   // "train_data_path": ,
   // "validation_data_path": ,
-  "train_data_path": if CORPUS == "tsm" then "/home/nlpmaster/ssd-1t/corpus/TSM/trains"
-    else "/home/nlpmaster/Works/egs/fisher_callhome_spanish/s5/data/train/feats.scp",
-  "validation_data_path": if CORPUS == "tsm" then "/home/nlpmaster/ssd-1t/corpus/TSM/valids"
-    else "/home/nlpmaster/Works/egs/fisher_callhome_spanish/s5/data/dev/feats.scp",
+  "train_data_path": if CORPUS == "tsm" then std.extVar("TSM_TRAIN_PATH") 
+    else std.extVar("FISHER_TRAIN_PATH"),
+  "validation_data_path": if CORPUS == "tsm" then std.extVar("TSM_VAL_PATH")
+    else std.extVar("FISHER_VAL_PATH"),
   "model": {
     "type": "phn_mocha",
     "input_size": NUM_MELS * FRAME_RATE,
@@ -240,7 +241,7 @@ local PTS_READER = {
     "from_candidates": false,
     "sampling_strategy": if OCD then "sample" else "max",
     "max_decoding_ratio": 1.0,
-    "dep_ratio": 0.1,
+    "dep_ratio": if DEP then 0.1 else 0.0,
     "pos_ratio": 0.0,
     "time_mask_width": 0,
     "freq_mask_width": 0,
@@ -259,7 +260,7 @@ local PTS_READER = {
     //   "wdrop": 0.0,
     //   "stack_rates": [2, 2],
     // },
-    "att_ratio": 0.9,
+    "att_ratio": if DEP then 0.9 else 1.0,
     "encoder": {
       "type": "lstm",
       "input_size": VGG_OUTPUT_SIZE,
