@@ -1,6 +1,6 @@
 from typing import Dict, List, Tuple, Any, Union
-from itertools import groupby
 
+import re
 from overrides import overrides
 
 import torch
@@ -89,6 +89,7 @@ class PhnMoChA(Model):
                  encoder: Seq2SeqEncoder,
                  input_size: int,
                  target_embedding_dim: int,
+                 decoder_hidden_dim: int,
                  max_decoding_steps: int,
                  max_decoding_ratio: float = 1.5,
                  dep_parser: Model = None,
@@ -119,6 +120,7 @@ class PhnMoChA(Model):
                  target_namespace: str = "tokens",
                  phoneme_target_namespace: str = "phonemes",
                  dropout: float = 0.0,
+                 blank: str = "_",
                  sampling_strategy: str = "max",
                  from_candidates: bool = False,
                  scheduled_sampling_ratio: float = 0.,
@@ -130,6 +132,7 @@ class PhnMoChA(Model):
         self._scheduled_sampling_ratio = scheduled_sampling_ratio
         self._sampling_strategy = sampling_strategy
         self._train_at_phn_level = train_at_phn_level
+        self._blank = blank
 
         self._dep_parser = dep_parser
         self._pos_tagger = pos_tagger
@@ -203,8 +206,7 @@ class PhnMoChA(Model):
         # Decoder output dim needs to be the same as the encoder output dim since we initialize the
         # hidden state of the decoder with the final hidden state of the encoder.
         self._encoder_output_dim = self._encoder.get_output_dim()
-        #self._decoder_output_dim = self._encoder_output_dim
-        self._decoder_output_dim = target_embedding_dim
+        self._decoder_output_dim = decoder_hidden_dim
         self._dec_layers = dec_layers
         if self._decoder_output_dim != self._encoder_output_dim:
             self.bridge = nn.Linear(
@@ -344,7 +346,6 @@ class PhnMoChA(Model):
         -------
         Dict[str, torch.Tensor]
         """
-        # print([self._indices_to_tokens(tokens.tolist()) for tokens in target_tokens[self._target_namespace]])
         output_dict = {}
         if dataset is not None:
             self._target_granularity = dataset[0]
@@ -437,6 +438,20 @@ class PhnMoChA(Model):
                         best_predictions = top_k_predictions[:, 0, :]
                         self._logs["att_bleu"](best_predictions, targets)
                         self._logs["att_wer"](best_predictions, targets)
+                    log_dict = self.decode(output_dict)
+                    verbose_target = [self._indices_to_tokens(tokens.tolist()[1:]) 
+                                      for tokens in target_tokens[self._target_namespace]]
+                    verbose_best_pred = [beams[0] for beams in log_dict["predicted_tokens"]]
+                    with open(f"preds.{epoch_num[0]}.txt", "a+") as fp:
+                        fp.write("\n".join(["".join(map(lambda s: re.sub(self._blank, " ", s), words))
+                                            for words in verbose_best_pred]))
+                        fp.write("\n")
+                    with open(f"golds.{epoch_num[0]}.txt", "a+") as fp:
+                        fp.write("\n".join(["".join(map(lambda s: re.sub(self._blank, " ", s), words))
+                                            for words in verbose_target]))
+                        fp.write("\n")
+                    # for gold, pred in zip(verbose_target, verbose_best_pred):
+                    #     print(gold, pred)
 
         if self.training:
             output_dict = self._collect_losses(output_dict,

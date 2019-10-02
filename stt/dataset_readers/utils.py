@@ -78,7 +78,7 @@ def pad_and_stack(array: Union[np.ndarray, torch.Tensor],
         stacked_array = padded_array.reshape(new_shape)
         return stacked_array, new_len
 
-def get_fisher_callhome_transcripts(root: str, corpus: str, split: str,
+def get_fisher_callhome_transcripts(root: str, trn_dir: str, corpus: str, split: str,
                                     src_lang: str = 'es', tgt_lang: str = 'en',
                                     num_tgt_trns: int = 4
                                     ) -> Tuple[List[List[str]], List[str], List[List[str]]]:
@@ -89,17 +89,17 @@ def get_fisher_callhome_transcripts(root: str, corpus: str, split: str,
     with open(root.joinpath(mapping_dir, f"{corpus}_{split}")) as fp:
         utt_ids = [line.split(" ") for line in fp.read().splitlines()]
 
-    with open(root.joinpath(corpus_dir, "ldc", f"{corpus}_{split}.{src_lang}")) as fp:
+    with open(root.joinpath(corpus_dir, trn_dir, f"{corpus}_{split}.{src_lang}")) as fp:
         src_transcripts = fp.read().splitlines()
 
     list_of_tgt_transcripts = []
     if split != 'train':
         for idx in range(num_tgt_trns):
-            with open(root.joinpath(corpus_dir, "ldc", f"{corpus}_{split}.{tgt_lang}.{idx}")) as fp:
+            with open(root.joinpath(corpus_dir, trn_dir, f"{corpus}_{split}.{tgt_lang}.{idx}")) as fp:
                 tgt_transcripts = fp.read().splitlines()
                 list_of_tgt_transcripts.append(tgt_transcripts)
     else:
-        with open(root.joinpath(corpus_dir, "ldc", f"{corpus}_{split}.{tgt_lang}")) as fp:
+        with open(root.joinpath(corpus_dir, trn_dir, f"{corpus}_{split}.{tgt_lang}")) as fp:
             tgt_transcripts = fp.read().splitlines()
             list_of_tgt_transcripts.append(tgt_transcripts)
 

@@ -30,17 +30,19 @@ logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 CTC_SRC_TGT_LEN_RATIO = 2
 
-def get_iterator(dataset_size: int, shard_size: int, bucket: bool = True):
+def get_iterator(dataset_size: int, shard_size: int, bucket: bool = True, shuffle: bool = True):
     if bucket:
         batch_indices = list(range(0, dataset_size, shard_size))
-        np.random.shuffle(batch_indices)
+        if shuffle:
+            np.random.shuffle(batch_indices)
         for batch_idx in batch_indices:
             end = min(batch_idx + shard_size, dataset_size)
             for idx in range(batch_idx, end):
                 yield idx
     else:
         indices = list(range(dataset_size))
-        np.random.shuffle(indices)
+        if shuffle:
+            np.random.shuffle(indices)
         for idx in indices:
             yield idx
 
@@ -213,12 +215,14 @@ class SpeechToTextDatasetReader(DatasetReader):
                  target_token_indexers: Dict[str, TokenIndexer] = None,
                  target_add_start_end_token: bool = False,
                  delimiter: str = "\t",
+                 blank: str = "_",
                  curriculum: List[Tuple[int, int]] = None,
                  online: bool = False,
                  num_mel_bins: int = 80,
                  mmap: bool = True,
                  dep: bool = False,
                  bucket: bool = False,
+                 shuffle: bool = True,
                  noskip: bool = False,
                  lazy: bool = False) -> None:
         super().__init__(lazy)
@@ -235,6 +239,7 @@ class SpeechToTextDatasetReader(DatasetReader):
         self._target_add_start_end_token = target_add_start_end_token
         self._pad_mode = "wrap" if input_stack_rate == 1 else "constant"
         self._bucket = bucket
+        self._shuffle = shuffle
         self._max_frames = max_frames
         self._curriculum = curriculum
         self._epoch_num = 0
@@ -244,6 +249,7 @@ class SpeechToTextDatasetReader(DatasetReader):
         self._online = online
         self._num_mel_bins = num_mel_bins
         self._noskip = noskip
+        self._blank = blank
 
         cc = OpenCC('s2t')
         if lexicon_path is not None:
@@ -263,9 +269,9 @@ class SpeechToTextDatasetReader(DatasetReader):
         self._fisher_callhome_datas = None
 
         if fisher_ch is not None:
-            root, corpus, split = fisher_ch
+            root, trn_dir, corpus, split = fisher_ch
             self._fisher_callhome_datas = \
-                get_fisher_callhome_transcripts(root, corpus, split)
+                get_fisher_callhome_transcripts(root, trn_dir, corpus, split)
 
     @overrides
     def _read(self, file_path: str) -> Iterable[Instance]:
@@ -282,7 +288,7 @@ class SpeechToTextDatasetReader(DatasetReader):
             source_datas, target_datas, annotations, dataset_size = \
                 kaldi_get_datas(file_path, targets, self._dep)
 
-        iterator = get_iterator(dataset_size, self._shard_size, self._bucket)
+        iterator = get_iterator(dataset_size, self._shard_size, self._bucket, self._shuffle)
 
         for idx in iterator:
             drop = False
@@ -361,6 +367,9 @@ class SpeechToTextDatasetReader(DatasetReader):
         source_field = ArrayField(source)
 
         if target_string is not None:
+            if not self._word_level:
+                target_string = re.sub("\s+", " _ ", target_string)
+
             target = self._target_tokenizer.tokenize(target_string)
             target_field = TextField(target,
                                      self._target_token_indexers)

@@ -1,7 +1,8 @@
 local BATCH_SIZE = 16;
 local FRAME_RATE = 1;
 local CORPUS = "fisher";
-local CHAR = false;
+local CHAR = true;
+local BLANK = "_";
 local WORD_LEVEL = CORPUS != "tsm" && !CHAR;
 local TARGET_EMBEDDING_DIM = if CORPUS == "fisher" && CHAR then 64 else 512;
 local ENCODER_HIDDEN_SIZE = 512;
@@ -15,7 +16,7 @@ local CHAR_TARGET_NAMESPACE = "characters";
 local WORD_TARGET_NAMESPACE = "tokens";
 local PHN_TARGET_NAMESPACE = "phonemes";
 local TARGET_NAMESPACE = if WORD_LEVEL then WORD_TARGET_NAMESPACE else CHAR_TARGET_NAMESPACE;
-local NUM_THREADS = 1;
+local NUM_THREADS = 0;
 local VGG = true;
 local VGG_LAYERS = 2;
 local OUT_CHANNEL = 32;
@@ -27,6 +28,7 @@ local SUMMARY_INTERVAL = 100;
 local ENCODER_OUTPUT_SIZE = ENCODER_HIDDEN_SIZE * DIRECTIONS;
 local OCD = false;
 local DELTA = 2;
+local TRN_DIR = if WORD_LEVEL then "ldc" else "detok-ldc";
 
 local PARSER = {
       "type": "biaffine_parser",
@@ -80,14 +82,14 @@ local BASE_ITERATOR = {
   "type": "bucket",
   "padding_noise": 0.0,
   "batch_size" : BATCH_SIZE,
-  "sorting_keys": [["source_features", "dimension_0"],
-                    ["target_tokens", "num_tokens"]],
   "max_instances_in_memory": 1024 * BATCH_SIZE,
+  "sorting_keys": [["source_features", "dimension_0"],
+                   ["target_tokens", "num_tokens"]],
   #"maximum_samples_per_batch": ["dimension_0", 36000],
   "track_epoch": true,
 };
 
-local ITERATOR = if NUM_THREADS < 1 then BASE_ITERATOR else
+local TRAIN_ITERATOR = if NUM_THREADS < 1 then BASE_ITERATOR else
 {
   "type": "multiprocess",
   "base_iterator": BASE_ITERATOR, # + {"instances_per_epoch": 1280000},
@@ -141,9 +143,10 @@ local FISHER_READER = {
   "online": false,
   "word_level": WORD_LEVEL,
   "discard_energy_dim": true,
-  "dep": true,
+  "dep": DEP,
+  "blank": BLANK,
   #"lexicon_path": std.extVar("LEXICON_PATH"), 
-  "fisher_ch": [std.extVar("FISHER_PATH"), "fisher", "train"],
+  "fisher_ch": [std.extVar("FISHER_PATH"), TRN_DIR, "fisher", "train"],
   "shard_size": BATCH_SIZE,
   "input_stack_rate": FRAME_RATE,
   "model_stack_rate": STACK_RATE,
@@ -180,12 +183,14 @@ local FISHER_READER = {
 };
 
 local VALID_TSM_READER = TSM_READER + {
-    "noskip": true
+    "noskip": true,
+    "shuffle": false,
 };
 
 local VALID_FISHER_READER = FISHER_READER + {
     "noskip": true,
-    "fisher_ch": [std.extVar("FISHER_PATH"), "fisher", "dev"]
+    "fisher_ch": [std.extVar("FISHER_PATH"), TRN_DIR, "fisher", "dev"],
+    "shuffle": false,
 };
 
 local PTS_READER = {
@@ -275,6 +280,7 @@ local VAL_BASE_READER = if CORPUS == "tsm" then VALID_TSM_READER else VALID_FISH
     "delta": DELTA,
     "dep_parser": if DEP then PARSER else null,
     "pos_tagger": if (DEP && POS) then TAGGER else null,
+    "blank": BLANK,
     // "encoder": {
     //   "type": "awd-rnn",
     //   "input_size": NUM_MELS * FRAME_RATE,
@@ -294,6 +300,7 @@ local VAL_BASE_READER = if CORPUS == "tsm" then VALID_TSM_READER else VALID_FISH
       "num_layers": 4,
       "bidirectional": (DIRECTIONS == 2)
     },
+    "decoder_hidden_dim": DECODER_HIDDEN_SIZE,
     // "ctc_layer": {
     //   "type": "ctc",
     //   "target_namespace": TARGET_NAMESPACE,
@@ -412,8 +419,12 @@ local VAL_BASE_READER = if CORPUS == "tsm" then VALID_TSM_READER else VALID_FISH
       #["_target_embedder.weight", "prevent"],
     ]
   },
-  "iterator": ITERATOR,// + {"instances_per_epoch": 1280},
-  "validation_iterator": ITERATOR,
+  "iterator": TRAIN_ITERATOR,// + {"instances_per_epoch": 1280},
+  "validation_iterator": {
+    "type": "basic",
+    "batch_size" : BATCH_SIZE,
+    "track_epoch": true,
+  },
   "trainer": {
     "type": "ignore_nan",
     #"mixed_precision": true,
