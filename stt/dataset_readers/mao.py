@@ -139,11 +139,15 @@ def kaldi_get_datas(file_path: str, targets: List[Tuple[str]],
     instances_before_filtering = len(targets)
 
     targets = list(filter(lambda fields: fields[2].strip(), targets))
+    logger.warning(f"number of empty targets: {instances_before_filtering - len(targets)}")
 
     orders = [i for i, fields in enumerate(targets) if
         all(utt_id in raw_src_datas for utt_id in fields[0])]
+    ignored = [fields[0] for i, fields in enumerate(targets) if
+        not all(utt_id in raw_src_datas for utt_id in fields[0])]
 
-    dropped_instances = instances_before_filtering - len(targets)
+    print(ignored)
+    dropped_instances = len(targets) - len(orders)
     if not dropped_instances:
         logger.info("No instances dropped from {}.".format(file_path))
     else:

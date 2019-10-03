@@ -29,6 +29,9 @@ local ENCODER_OUTPUT_SIZE = ENCODER_HIDDEN_SIZE * DIRECTIONS;
 local OCD = false;
 local DELTA = 2;
 local TRN_DIR = if WORD_LEVEL then "ldc" else "detok-ldc";
+local POS_RATIO = if POS then 0.05 else 0.0;
+local DEP_RATIO = if DEP then 0.1 else 0.0;
+local ATT_RATIO = 1 - POS_RATIO - DEP_RATIO;
 
 local PARSER = {
       "type": "biaffine_parser",
@@ -272,8 +275,9 @@ local VAL_BASE_READER = if CORPUS == "tsm" then VALID_TSM_READER else VALID_FISH
     "from_candidates": false,
     "sampling_strategy": if OCD then "sample" else "max",
     "max_decoding_ratio": 1.0,
-    "dep_ratio": if DEP then 0.1 else 0.0,
-    "pos_ratio": 0.0,
+    "dep_ratio": DEP_RATIO,
+    "pos_ratio": POS_RATIO,
+    "att_ratio": ATT_RATIO,
     "time_mask_width": 0,
     "freq_mask_width": 0,
     "time_mask_max_ratio": 0.0,
@@ -292,7 +296,6 @@ local VAL_BASE_READER = if CORPUS == "tsm" then VALID_TSM_READER else VALID_FISH
     //   "wdrop": 0.0,
     //   "stack_rates": [2, 2],
     // },
-    "att_ratio": if DEP then 0.9 else 1.0,
     "encoder": {
       "type": "lstm",
       "input_size": VGG_OUTPUT_SIZE,
@@ -300,6 +303,7 @@ local VAL_BASE_READER = if CORPUS == "tsm" then VALID_TSM_READER else VALID_FISH
       "num_layers": 4,
       "bidirectional": (DIRECTIONS == 2)
     },
+    "scheduled_sampling_ratio": 0.2,
     "decoder_hidden_dim": DECODER_HIDDEN_SIZE,
     // "ctc_layer": {
     //   "type": "ctc",
@@ -432,7 +436,7 @@ local VAL_BASE_READER = if CORPUS == "tsm" then VALID_TSM_READER else VALID_FISH
     "patience": 20,
     "grad_norm": 2.0,
     "cuda_device": 0,
-    "validation_metric": "-att_wer",
+    "validation_metric": "+BLEU",
     "num_serialized_models_to_keep": 1,
     "should_log_learning_rate": true,
     // "learning_rate_scheduler": {

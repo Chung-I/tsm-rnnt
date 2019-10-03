@@ -442,12 +442,13 @@ class PhnMoChA(Model):
                     verbose_target = [self._indices_to_tokens(tokens.tolist()[1:]) 
                                       for tokens in target_tokens[self._target_namespace]]
                     verbose_best_pred = [beams[0] for beams in log_dict["predicted_tokens"]]
+                    sep = " " if self._target_namespace == 'tokens' else ""
                     with open(f"preds.{epoch_num[0]}.txt", "a+") as fp:
-                        fp.write("\n".join(["".join(map(lambda s: re.sub(self._blank, " ", s), words))
+                        fp.write("\n".join([sep.join(map(lambda s: re.sub(self._blank, " ", s), words))
                                             for words in verbose_best_pred]))
                         fp.write("\n")
                     with open(f"golds.{epoch_num[0]}.txt", "a+") as fp:
-                        fp.write("\n".join(["".join(map(lambda s: re.sub(self._blank, " ", s), words))
+                        fp.write("\n".join([sep.join(map(lambda s: re.sub(self._blank, " ", s), words))
                                             for words in verbose_target]))
                         fp.write("\n")
                     # for gold, pred in zip(verbose_target, verbose_best_pred):
