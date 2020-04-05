@@ -221,7 +221,7 @@ class PhnMoChA(Model):
                                 num_layers=self._dec_layers, batch_first=True)
 
         self._num_phn_classes = self.vocab.get_vocab_size(self._phn_target_namespace)
-        self._ctc_projection_layer = nn.Linear(self._encoder_output_dim, self._num_phn_classes)
+        #self._ctc_projection_layer = nn.Linear(self._encoder_output_dim, self._num_phn_classes)
         self._ctc_loss = nn.CTCLoss(blank=self._phn_pad_index)
         self._n_pretrain_ctc_epochs = n_pretrain_ctc_epochs
         self._ctc_proj_drop = nn.Dropout(p=dropout)
