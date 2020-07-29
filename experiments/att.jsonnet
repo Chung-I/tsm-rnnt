@@ -163,7 +163,7 @@
                 84
             ]
         },
-        "num_epochs": 300,
+        "num_epochs": 6,
         "num_serialized_models_to_keep": 1,
         "optimizer": {
             "type": "adadelta",
