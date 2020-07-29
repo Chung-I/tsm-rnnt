@@ -41,7 +41,8 @@ For more options, run `allennlp train -h`.
 ```=bash
 allennlp evaluate SERIALIZATION_DIR VAL_DATA_PATH --output-file OUTPUT_FILE --include-package stt
 ```
-For NTU Speech Lab users, `VAL_DATA_PATH=/groups/public/TSM/valids`.
+For NTU Speech Lab users, `VAL_DATA_PATH=/groups/public/TSM/valids`; a
+pretrained model is readily available at `SERIALIZATION_DIR=/groups/public/tsm-rnnt-runs/uttcmvn-pure-attn-2`.
 For more options, run `allennlp evaluate -h`.
 
 ### prediction
