@@ -28,20 +28,61 @@ pip install torchaudio -f https://download.pytorch.org/whl/torch_stable.html
 
 ## Usage
 
-### training
+### data preparation
+The file structure of training/validation datas should be arranged as follows:
+```
+TRAIN_ROOT
+├── refs.txt
+├── trn.txt
+│── corpus_1
+│   ├── 1.wav
+│   └── 2.wav
+└── corpus_2
+    ├── 1.wav
+    └── 2.wav
+```
+Dataset readers take two files: `refs.txt` and `trn.txt`:
+The `refs.txt` should store paths of audio files:
+```
+corpus_1/1.wav
+corpus_1/2.wav
+corpus_2/1.wav
+corpus_2/2.wav
+```
+And the `trn.txt` should store their corresponding transcripts:
+```
+<transcript of corpus_1/1.wav>
+<transcript of corpus_1/2.wav>
+<transcript of corpus_2/1.wav>
+<transcript of corpus_2/2.wav>
+```
 
+Feature extraction is performed by [`torchaudio.compliance.kaldi.fbank`](https://pytorch.org/audio/compliance.kaldi.html#torchaudio.compliance.kaldi.fbank).
+
+If you are NTU Speech Lab users and want to use the 1500hrs TSMDrama data,
+extracted filterbanks are readily available at `/groups/public/TSM/trains/data.npy`; don't forget to set the value of the key `online` to `false` in `data_readers` and `validation_data_readers` for `experiments/att.jsonnet`.
+```
+/groups/public/TSM/trains
+├── refs.txt
+├── trn.txt
+├── data.npy
+└── lens.npy
+```
+### training
 ```=bash
-export DATA_ROOT=/where/TSM/directory/lies/in
+export TRAIN_ROOT=/where/training/data/lies
+export VAL_ROOT=/where/validation/data/lies
 allennlp train experiments/att.jsonnet -s SERIALIZATION_DIR --include-package stt
 ```
-For NTU Speech Lab users, `DATA_ROOT=/groups/public/`.
+For NTU Speech Lab users, `TRAIN_ROOT=/groups/public/TSM/trains`;
+`VAL_ROOT=/groups/public/TSM/valids`.
 `SERIALIZATION_DIR`: directory in which to save the model and its logs
 For more options, run `allennlp train -h`.
 ### evaluation
 ```=bash
-allennlp evaluate SERIALIZATION_DIR VAL_DATA_PATH --output-file OUTPUT_FILE --include-package stt
+allennlp evaluate SERIALIZATION_DIR VAL_ROOT --output-file OUTPUT_FILE --include-package stt
 ```
-For NTU Speech Lab users, `VAL_DATA_PATH=/groups/public/TSM/valids`; a
+For NTU Speech Lab users, `VAL_ROOT=/groups/public/TSM/valids`; a
 pretrained model is readily available at `SERIALIZATION_DIR=/groups/public/tsm-rnnt-runs/uttcmvn-pure-attn-2`.
 For more options, run `allennlp evaluate -h`.
 

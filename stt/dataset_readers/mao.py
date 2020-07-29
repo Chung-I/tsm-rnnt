@@ -262,7 +262,7 @@ class SpeechToTextDatasetReader(DatasetReader):
             src = source_datas(idx)
             tgt = target_datas(idx)
             annotation = annotations(idx)
-            if src.shape[0] == 0 or not tgt.strip():
+            if not isinstance(src, str) and src.shape[0] == 0 or not tgt.strip():
                 drop = True
             else:
                 instance = self.text_to_instance(src, tgt, annotation)

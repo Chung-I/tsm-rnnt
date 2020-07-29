@@ -10,7 +10,7 @@
         "mmap": true,
         "model_stack_rate": 4,
         "num_mel_bins": 80,
-        "online": false,
+        "online": true,
         "shard_size": 16,
         "target_add_start_end_token": true,
         "target_token_indexers": {
@@ -148,8 +148,8 @@
         "time_mask_max_ratio": 0,
         "time_mask_width": 0
     },
-    "train_data_path": std.extVar("DATA_ROOT") + "TSM/trains",
-    "validation_data_path": std.extVar("DATA_ROOT") + "TSM/valids",
+    "train_data_path": std.extVar("TRAIN_ROOT"),
+    "validation_data_path": std.extVar("VAL_ROOT"),
     "trainer": {
         "type": "ignore_nan",
         "cuda_device": 0,
@@ -190,7 +190,7 @@
         "model_stack_rate": 4,
         "noskip": true,
         "num_mel_bins": 80,
-        "online": false,
+        "online": true,
         "shard_size": 16,
         "target_add_start_end_token": true,
         "target_token_indexers": {
