@@ -35,12 +35,30 @@ class OnlineSpeechToTextPredictor(Predictor):
     def predict(self,
                 wavfile: str,
                 transcript: str = None) -> JsonDict:
-        with self.capture_model_internals() as internals:
-            results = self.predict_json({
-                "wav": wavfile,
-                "target_string": transcript
-            })
-            return {**results, "model_internals": internals}
+        results = self.predict_json({
+            "wav": wavfile,
+            "target_string": transcript
+        })
+        return results["predicted_tokens"][0]
+        #with self.capture_model_internals() as internals:
+        #    results = self.predict_json({
+        #        "wav": wavfile,
+        #        "target_string": transcript
+        #    })
+        #    return {**results, "model_internals": internals}
+    @overrides
+    def dump_line(self, outputs: JsonDict) -> str:  # pylint: disable=no-self-use
+        return " ".join(outputs) + '\n'
+
+    @overrides
+    def predict_instance(self, instance: Instance) -> JsonDict:
+        outputs = self._model.forward_on_instance(instance)
+        return outputs["predicted_tokens"][0]
+
+    @overrides
+    def predict_batch_instance(self, instances: List[Instance]) -> List[JsonDict]:
+        outputs = self._model.forward_on_instances(instances)
+        return [output["predicted_tokens"][0] for output in outputs]
 
     @contextmanager
     def capture_model_internals(self) -> Iterator[dict]:

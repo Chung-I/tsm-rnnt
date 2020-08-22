@@ -71,7 +71,7 @@ def data_func_factory(data_gen, orders):
 
     return data_func
 
-def mao_get_datas(file_path: str, online: bool = False,
+def mao_get_datas(file_path: str, online: bool = False, trn_file: str = "trn.txt",
                   mmap: bool = True, dep: bool = False) -> Tuple[Callable, Callable, Callable, int]:
     source_orders = None
     try:
@@ -98,7 +98,7 @@ def mao_get_datas(file_path: str, online: bool = False,
             source_datas = [os.path.join(file_path, wav) for wav in f.read().splitlines()]
             src_data_gen = lambda idx: source_datas[idx]
 
-    with open(os.path.join(file_path, "trn.txt")) as f:
+    with open(os.path.join(file_path, trn_file)) as f:
         target_datas = f.read().splitlines()
 
     src_data_func = data_func_factory(src_data_gen, source_orders)
@@ -111,7 +111,7 @@ def mao_get_datas(file_path: str, online: bool = False,
     anno_data_func = data_func_factory(lambda idx: annotations[idx] if annotations else None,
                                        source_orders)
 
-    return src_data_func, tgt_data_func, anno_data_func, len(source_orders)
+    return src_data_func, tgt_data_func, anno_data_func, len(target_datas)
 
 def kaldi_get_datas(file_path: str, targets: List[Tuple[str]],
                     dep: bool = False) -> Tuple[Callable, Callable, Callable, int]:
@@ -193,6 +193,7 @@ class SpeechToTextDatasetReader(DatasetReader):
                  dep: bool = False,
                  bucket: bool = False,
                  noskip: bool = False,
+                 trn_file: str = "trn.txt",
                  lazy: bool = False) -> None:
         super().__init__(lazy)
         self._target_tokenizer = target_tokenizer or WordTokenizer()
@@ -217,6 +218,7 @@ class SpeechToTextDatasetReader(DatasetReader):
         self._online = online
         self._num_mel_bins = num_mel_bins
         self._noskip = noskip
+        self._trn_file = trn_file
 
         cc = OpenCC('s2t')
         if lexicon_path is not None:
@@ -248,7 +250,8 @@ class SpeechToTextDatasetReader(DatasetReader):
 
         if self._fisher_callhome_datas is None:
             source_datas, target_datas, annotations, dataset_size = \
-                mao_get_datas(file_path, self._online, self._mmap, self._dep)
+                mao_get_datas(file_path, self._online, self._trn_file,
+                              self._mmap, self._dep)
         else:
             utt_ids, src_trns, list_of_tgt_trns = self._fisher_callhome_datas
             targets = zip(utt_ids, src_trns, *list_of_tgt_trns)

@@ -1,0 +1,24 @@
+{
+  "_attention._combined_projection.weight": "xavier_uniform",
+  "_attention._combined_projection.bias": "zeros",
+  "_attention._query_projection.weight": "xavier_uniform",
+  "_attention._query_projection.bias": "zeros",
+  "_attention._output_projection.weight": "xavier_uniform",
+  "_attention._output_projection.bias": "zeros",
+  "_target_embedder.weight": {
+    "type": "uniform",
+    "params": {
+      "a": -1,
+      "b": 1
+    }
+  },
+  "bridge.weight": "xavier_uniform",
+  "att_out.weight": "xavier_uniform",
+  "att_out.bias": "zeros",
+  "_decoder.weight_ih_l0": "xavier_uniform",
+  "_decoder.weight_hh_l0": "orthogonal",
+  "_decoder.bias_ih_l0": "zeros",
+  "_decoder.bias_hh_l0": "lstm_hidden_bias",
+  "_output_projection_layer.weight": "xavier_uniform",
+  "_output_projection_layer.bias": "zeros"
+}
