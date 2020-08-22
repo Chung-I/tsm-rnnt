@@ -144,3 +144,27 @@ echo "WAVFILE REF"| allennlp predict --predictor online_stt --output-file OUTPUT
 ### Predict Mandarin Zhuyin
 Two pass decoding:
 TSM audio -> Mandarin Zhuyin -> Chinese Characters
+
+### fine-tuning on TAT-Vol1-lavalier from pretrained encoder and decoder character embeddings
+```=bash
+export DATA_ROOT=/where/data/lies
+bash ft.sh SERIALIZATION_DIR
+```
+For NTU Speech Lab users, `DATA_ROOT=/groups/public`;
+
+### fine-tuning on TAT-Vol1-lavalier from pretrained encoder (decoder is reinitialized)
+```=bash
+export DATA_ROOT=/where/data/lies
+bash ft-reinit.sh SERIALIZATION_DIR
+```
+For NTU Speech Lab users, `DATA_ROOT=/groups/public`;
+
+### train on TAT-Vol1-lavalier from scratch
+```=bash
+python3 tools/make_trns.py $DATA_ROOT/TAT-Vol1-train-lavalier-train $DATA_ROOT/TAT-Vol1-train-lavalier-train --field $FIELD --tokenizer char
+python3 tools/make_trns.py $DATA_ROOT/TAT-Vol1-train-lavalier-dev $DATA_ROOT/TAT-Vol1-train-lavalier-dev --field $FIELD --tokenizer char
+TRAIN_ROOT="$DATA_ROOT/TAT-Vol1-train-lavalier-train" VAL_ROOT="$DATA_ROOT/TAT-Vol1-train-lavalier-dev" FIELD="漢羅台文"  python3 run.py train experiments/ft.jsonnet -s runs/TAT-specaug --include-package stt
+```
+
+For NTU Speech Lab users, `DATA_ROOT=/groups/public`;
+`FIELD` can be 漢羅台文or台羅數字調
