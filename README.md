@@ -50,15 +50,12 @@ echo "WAVFILE REF"| allennlp predict --predictor online_stt --output-file OUTPUT
 ```
 `WAVFILE`: e.g. `speech.wav`.
 `REF`: reference transcript. Currently this only has effect on attention-based model where reference transcript is used when doing in inference through teacher forcing, but still has to be provided when using online models like RNN Transducer and CTC. Will fixed it in the near future.
-## Performance
-| Model | CER | character BLEU |
-| ----- | --- | ----- |
-| Offline (Attn) | 36.5% | 47.8|
-| Online (CTC) | 45.5% | 34.4 |
-| Online(RNNT) | 45.1% | 40.7 |
-
-## Todos
-- 補上 Offline models
+## Performance (evaluated on 平凡很幸福)
+| Model | CER | character BLEU | model checkpoint |
+| ----- | --- | ----- | ----- |
+| Offline (Attn) | 37.8% | 48.9 | [link](https://drive.google.com/file/d/11vLwmOYxfR0w72HgEmhdj3SV5Nt5yPYb/view?usp=sharing) |
+| Online (CTC) | 45.5% | 34.4 | - |
+| Online(RNNT) | 45.1% | 40.7 | - |
 
 ## 劇名
 
@@ -95,9 +92,3 @@ echo "WAVFILE REF"| allennlp predict --predictor online_stt --output-file OUTPUT
 - 讓愛飛翔
 - 在愛之外
 - 生命桃花源
-
-
-## Possible future directions
-### Predict Mandarin Zhuyin
-Two pass decoding:
-TSM audio -> Mandarin Zhuyin -> Chinese Characters
