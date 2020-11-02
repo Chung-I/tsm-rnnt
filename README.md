@@ -94,11 +94,12 @@ echo "WAVFILE REF"| allennlp predict --predictor online_stt --output-file OUTPUT
 `WAVFILE`: e.g. `speech.wav`.
 `REF`: reference transcript. Currently this only has effect on attention-based model where reference transcript is used when doing in inference through teacher forcing, but still has to be provided when using online models like RNN Transducer and CTC. Will fixed it in the near future.
 ## Performance
-| Model | CER | character BLEU |
-| ----- | --- | ----- |
-| Offline (Attn) | 36.5% | 47.8|
-| Online (CTC) | 45.5% | 34.4 |
-| Online(RNNT) | 45.1% | 40.7 |
+results were evaluated on 平凡很幸福：
+| Model | CER | character BLEU | model checkpoint |
+| ----- | --- | ----- | ----- |
+| Offline (Attn) | 37.8% | 48.9 | [link](https://drive.google.com/file/d/11vLwmOYxfR0w72HgEmhdj3SV5Nt5yPYb/view?usp=sharing) |
+| Online (CTC) | 45.5% | 34.4 | - |
+| Online(RNNT) | 45.1% | 40.7 | - |
 
 ## Todos
 - 補上 Offline models
@@ -139,13 +140,20 @@ echo "WAVFILE REF"| allennlp predict --predictor online_stt --output-file OUTPUT
 - 在愛之外
 - 生命桃花源
 
+### Performance on TAT-train-lavalier-dev
+We fine-tuned the  [Offline (Attn) model](https://drive.google.com/file/d/11vLwmOYxfR0w72HgEmhdj3SV5Nt5yPYb/view?usp=sharing) mentioned above on [TAT-train-lavalier](https://sites.google.com/speech.ntut.edu.tw/fsw/home/challenge-2020), a Taiwanese speech recognition challenge corpus. We split it further into TAT-train-lavalier-train (`/groups/public/TAT-Vol1-train-lavalier-train` on battleship) and TAT-train-lavalier-dev (`/groups/public/TAT-Vol1-train-lavalier-dev` on battleship) and report score on the latter split.
+| Model      | CER on 漢羅台文 (no punct)  |  CER on 台羅數字調 |
+| -----      | -----------                | ---------------- |
+| FT-SpecAug | 27.4% （繼承原模型embedding) ([model](https://drive.google.com/drive/folders/1kXT9KHdsTkj6anrIDFKegVzd1YNQ5ZQd?usp=sharing)) | 12.6% ([model](https://drive.google.com/drive/folders/10h23s4NwoFSJOon0grnd1uJRvWyVDkYq?usp=sharing)) |
+| SpecAug    | 51.8% ([model](https://drive.google.com/drive/folders/1auxXgJyliqwHLeLKJ20kMRQf48GULu77?usp=sharing)) | 13.8% ([model](https://drive.google.com/drive/folders/14mXqSZBGPEMAgYQLPXwhhatJFcO1w0vD?usp=sharing))|
 
-## Possible future directions
-### Predict Mandarin Zhuyin
-Two pass decoding:
-TSM audio -> Mandarin Zhuyin -> Chinese Characters
+FT-SpecAug: [SpecAugment](https://arxiv.org/abs/1904.08779), decoder parameter transfer(including both input and output character embedding)
+(On battleship)
+gold: `/groups/public/TAT-Vol1-train-lavalier-dev/trn.txt`
+pred: `/groups/public/tsm-rnnt-runs/TAT-ft-specaug/val_trn.txt`
 
 ### fine-tuning on TAT-Vol1-lavalier from pretrained encoder and decoder character embeddings
+put the [Offline (Attn) model](https://drive.google.com/file/d/11vLwmOYxfR0w72HgEmhdj3SV5Nt5yPYb/view?usp=sharing) in `SERIALIZATION_DIR` and run:
 ```=bash
 export DATA_ROOT=/where/data/lies
 bash ft.sh SERIALIZATION_DIR
@@ -153,6 +161,7 @@ bash ft.sh SERIALIZATION_DIR
 For NTU Speech Lab users, `DATA_ROOT=/groups/public`;
 
 ### fine-tuning on TAT-Vol1-lavalier from pretrained encoder (decoder is reinitialized)
+put the [Offline (Attn) model](https://drive.google.com/file/d/11vLwmOYxfR0w72HgEmhdj3SV5Nt5yPYb/view?usp=sharing) in `SERIALIZATION_DIR` and run:
 ```=bash
 export DATA_ROOT=/where/data/lies
 bash ft-reinit.sh SERIALIZATION_DIR
